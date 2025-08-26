@@ -1,0 +1,78 @@
+# Configuration file for Rubric-Based Grading System
+# Update this file with Canvas assignment IDs and course document paths
+
+[COURSES]
+# Format: course_name = Display Name, CRN
+hist109_section1 = HIST109 Section 1, 2480616
+hist109_section2 = HIST109 Section 2, 2480619
+hist110 = HIST110, 2486450
+# Add new courses here as needed
+
+[RUBRIC_ASSIGNMENTS]
+# Format: assignment_key = Display Name, canvas_assignment_id, course_id, documents_path
+# Note: course_id should match the Canvas course ID (CRN), documents_path is relative to ../db/text/
+module_assignment_109 = Module Assignment HIST109, 12345, 2480616, ../db/text/HIST109
+discussion_109 = Discussion Post HIST109, 12346, 2480616, ../db/text/HIST109
+final_essay_109 = Final Essay HIST109, 12347, 2480616, ../db/text/HIST109
+module_assignment_110 = Module Assignment HIST110, 12348, 2486450, ../db/text/HIST110
+discussion_110 = Discussion Post HIST110, 12349, 2486450, ../db/text/HIST110
+final_essay_110 = Final Essay HIST110, 12350, 2486450, ../db/text/HIST110
+
+# Add new assignments here:
+# assignment_key = Display Name, canvas_assignment_id, course_id, documents_path
+
+[COURSE_DOCUMENT_PATHS]
+# Course-specific document paths
+HIST109 = ../db/text/HIST109
+HIST110 = ../db/text/HIST110
+# Add new courses as needed
+
+[SETTINGS]
+# Default processing method (only individual is supported with rubrics currently)
+default_processing_method = Individual (Rubric-Based)
+# Debug mode default
+default_debug_mode = False
+# Default model
+default_model = claude-3-5-sonnet-20241022
+# Maximum tokens per document chunk
+max_tokens_per_chunk = 500
+# Document similarity threshold
+similarity_threshold = 0.1
+# Top-k documents to retrieve for context
+top_k_documents = 5
+# Maximum context length for grading prompts
+max_context_length = 2000
+
+[API_SETTINGS]
+# Canvas API settings
+canvas_secrets_file = /home/drkeithcox/canvas-secrets.key
+anthropic_key_file = /home/drkeithcox/anthropic.key
+# Maximum retries for API calls
+max_api_retries = 3
+# API timeout in seconds
+api_timeout = 30
+
+[PATHS]
+# File paths - modify if your directory structure changes
+submissions_directory = ./submissions/
+course_documents_base = ../db/text/
+embedding_cache_directory = ./embeddings_cache/
+logs_directory = ./logs/
+
+[GRADING_SCALES]
+# Letter grade boundaries (percentages)
+grade_a_min = 90.0
+grade_b_min = 80.0
+grade_c_min = 70.0
+grade_d_min = 60.0
+# Below grade_d_min is F
+
+[EMBEDDING_SETTINGS]
+# Sentence transformer model for embeddings
+embedding_model = all-MiniLM-L6-v2
+# Alternative models:
+# embedding_model = all-mpnet-base-v2  # Higher quality, slower
+# embedding_model = multi-qa-MiniLM-L6-cos-v1  # Optimized for Q&A
+batch_size = 32
+# Force refresh embeddings on startup
+force_refresh_embeddings = False
