@@ -38,9 +38,10 @@ class CanvasRubricAPI:
         Returns:
             Dictionary containing assignment and rubric data
         """
-        url = f"{self.canvas_url}/api/v1/courses/{course_id}/assignments/{assignment_id}"
+#        url = f"{self.canvas_url}/api/v1/courses/{course_id}/assignments/{assignment_id}"
+        url = f"{self.canvas_url}/courses/{course_id}/assignments/{assignment_id}"
         params = {
-            'include[]': ['rubric', 'rubric_assessment']
+            'include[]': ['rubric']
         }
         
         try:
