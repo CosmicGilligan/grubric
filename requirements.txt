@@ -16,3 +16,5 @@ xlsxwriter
 sentence-transformers 
 scikit-learn
 python-docx
+openai
+google-genai

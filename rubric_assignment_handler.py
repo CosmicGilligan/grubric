@@ -3,12 +3,17 @@ Rubric-based assignment handler
 Replaces the old question-based system with Canvas rubric integration
 """
 
-from typing import Dict, List, Tuple, Optional
+from __future__ import annotations
+
+from typing import Any, Dict, List, Tuple, Optional
 import logging
+import re
+
 from canvas_rubric_api import get_rubric_for_assignment
 from course_document_processor import CourseDocumentProcessor, load_course_embeddings
-import anthropic
-import re
+
+# Unified LLM interface (provider-agnostic)
+from llm_provider import LLMBase, AnthropicLLM  # AnthropicLLM only for backward-compat
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -27,7 +32,9 @@ class RubricAssignmentHandler:
         canvas_assignment_id: str,
         course_id: str,
         course_documents_path: str,
-        claude_client: anthropic.Anthropic,
+        # NEW: prefer llm, keep claude_client for backward compatibility
+        llm: Optional[LLMBase] = None,
+        claude_client: Optional[Any] = None,  # legacy raw Anthropic client
     ) -> None:
         """
         Initialize rubric-based assignment handler
@@ -38,32 +45,42 @@ class RubricAssignmentHandler:
             canvas_assignment_id: Canvas assignment ID for rubric retrieval
             course_id: Canvas course ID
             course_documents_path: Path to course documents (e.g., "../db/text/HIST109")
-            claude_client: Anthropic Claude API client
+            llm: Unified LLM wrapper (recommended). See llm_provider.LLMBase
+            claude_client: (deprecated) Raw Anthropic client; wrapped if llm not supplied
         """
         self.assignment_key = assignment_key
         self.display_name = display_name
         self.canvas_assignment_id = canvas_assignment_id
         self.course_id = course_id
         self.course_documents_path = course_documents_path
-        self.claude_client = claude_client
+
+        # Provider-agnostic LLM setup
+        if llm is not None:
+            self.llm = llm
+        elif claude_client is not None:
+            # Allow old call-sites to keep working by wrapping Anthropic client
+            self.llm = AnthropicLLM(claude_client)
+        else:
+            raise ValueError("You must provide either llm= (preferred) or claude_client= (deprecated).")
 
         # Initialize components
-        self.rubric_data: Dict = {}
+        self.rubric_data: Dict[str, Any] = {}
         self.document_processor: Optional[CourseDocumentProcessor] = None
         self.total_points: float = 0.0
-        self.rubric_criteria: List[Dict] = []
+        self.rubric_criteria: List[Dict[str, Any]] = []
 
         # Load rubric and documents
         self._load_rubric()
         self._load_course_documents()
 
+    # ──────────────────────────────────────────────────────────────────────
+    # Loading / setup
+    # ──────────────────────────────────────────────────────────────────────
     def _load_rubric(self) -> None:
         """Load rubric data from Canvas API"""
         try:
             logger.info(f"Loading rubric for assignment {self.canvas_assignment_id}")
-            self.rubric_data = get_rubric_for_assignment(
-                self.course_id, self.canvas_assignment_id
-            )
+            self.rubric_data = get_rubric_for_assignment(self.course_id, self.canvas_assignment_id)
 
             if self.rubric_data:
                 self.rubric_criteria = self.rubric_data.get("rubric_criteria", [])
@@ -72,9 +89,7 @@ class RubricAssignmentHandler:
                     f"Loaded rubric with {len(self.rubric_criteria)} criteria, {self.total_points} total points"
                 )
             else:
-                logger.warning(
-                    f"No rubric found for assignment {self.canvas_assignment_id}"
-                )
+                logger.warning(f"No rubric found for assignment {self.canvas_assignment_id}")
                 self.total_points = 100.0  # Default fallback
 
         except Exception as e:
@@ -99,6 +114,9 @@ class RubricAssignmentHandler:
         except Exception as e:
             logger.error(f"Error loading course documents: {e}")
 
+    # ──────────────────────────────────────────────────────────────────────
+    # Prompt construction
+    # ──────────────────────────────────────────────────────────────────────
     def get_rubric_prompt(self) -> str:
         """Generate rubric description for grading prompts"""
         if not self.rubric_criteria:
@@ -106,7 +124,6 @@ class RubricAssignmentHandler:
                 f"Grade this submission out of {int(self.total_points)} points based on "
                 "quality, accuracy, and completeness."
             )
-
         return self.rubric_data.get("formatted_rubric", "")
 
     def search_relevant_documents(
@@ -144,100 +161,112 @@ class RubricAssignmentHandler:
         # Ensure all parameters are valid strings
         if not submission_text or not isinstance(submission_text, str):
             submission_text = "No submission text provided"
-
         if not student_name or not isinstance(student_name, str):
             student_name = "Unknown Student"
-
         if not isinstance(additional_context, str):
             additional_context = ""
 
-        # Get relevant course materials - pass empty list instead of None
-        document_context = self.search_relevant_documents(submission_text, [])
+        # SAFE: compute document_context with a fallback
+        try:
+            document_context = self.search_relevant_documents(submission_text, [])
+        except Exception:
+            document_context = "No course documents available for context."
 
-        # Build the grading prompt
         prompt = f"""You are grading a student assignment using a specific rubric and course materials as context.
 
-STUDENT: {student_name}
+    STYLE:
+    - Write in neutral, document-centric third person.
+    - Do NOT refer to 'the student' and do NOT use 'you'.
+    - Refer to the work as 'the submission' or 'this submission'.
 
-{self.get_rubric_prompt()}
+    STUDENT: {student_name}
 
-{document_context}
+    {self.get_rubric_prompt()}
 
-{additional_context if additional_context else ""}
+    {document_context}
 
-STUDENT SUBMISSION:
-{submission_text}
+    {additional_context if additional_context else ""}
 
-GRADING INSTRUCTIONS:
-1. Evaluate the submission against each rubric criterion
-2. Use the course materials as context to assess accuracy and depth
-3. For each criterion, provide:
-   - Points earned out of possible points
-   - Specific justification based on rubric standards
-   - Reference to course materials when relevant
-4. Provide constructive feedback for improvement
+    STUDENT SUBMISSION:
+    {submission_text}
 
-Format your response as:
-CRITERION 1: [earned_points]/[max_points] - [detailed justification]
-CRITERION 2: [earned_points]/[max_points] - [detailed justification]
-...
-TOTAL SCORE: [total_earned]/[total_possible]
-OVERALL FEEDBACK: [comprehensive feedback and suggestions for improvement]
-"""
+    GRADING INSTRUCTIONS:
+    1. Evaluate the submission against each rubric criterion
+    2. Use the course materials as context to assess accuracy and depth
+    3. For each criterion, provide:
+    - Points earned out of possible points
+    - Specific justification based on rubric standards
+    - Reference to course materials when relevant
+    4. Provide constructive feedback for improvement
+
+    Format your response as:
+    CRITERION 1: [earned_points]/[max_points] - [detailed justification]
+    CRITERION 2: [earned_points]/[max_points] - [detailed justification]
+    ...
+    TOTAL SCORE: [total_earned]/[total_possible]
+    OVERALL FEEDBACK: [comprehensive feedback and suggestions for improvement]
+    """
         return prompt
 
-    def grade_submission(
-        self, submission_text: str, student_name: str, model: str = "claude-3-5-sonnet-20241022"
-    ) -> Dict:
-        """Grade a single submission using rubric and course documents"""
-        try:
-            # Create grading prompt
-            prompt = self.create_grading_prompt(submission_text, student_name)
 
-            # Call Claude API
-            response = self.claude_client.messages.create(
+    def build_system_prompt(self) -> str:
+        """Short system directive to keep the LLM on task and format."""
+        return (
+            "You are a meticulous grader. Follow the rubric strictly. "
+            "Write in neutral, document-centric third person. "
+            "Do NOT address the student directly and do NOT use second-person pronouns. "
+            "Avoid phrases like 'the student' or 'you'; instead refer to 'the submission' or 'this submission'. "
+            "Use the exact output format requested."
+        )
+
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Grading
+    # ──────────────────────────────────────────────────────────────────────
+    def grade_submission(self, submission_text: str, student_name: str, model: str) -> Dict[str, Any]:
+        """
+        Use the selected LLM to grade a single submission and return a result dict:
+        { 'student_name', 'score', 'max_score', 'letter_grade', 'feedback', 'criterion_scores', 'raw_response' }
+        """
+        try:
+            system_prompt = self.build_system_prompt()
+            user_prompt = self.create_grading_prompt(submission_text, student_name)
+
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ]
+
+            reply_text = self.llm.generate(
                 model=model,
-                max_tokens=2000,
-                system=(
-                    "You are an expert grader using a detailed rubric. "
-                    "Provide specific, constructive feedback based on the rubric criteria and course materials."
-                ),
-                messages=[{"role": "user", "content": prompt}],
+                messages=messages,
+                temperature=0.2,
+                max_tokens=1200,
             )
 
-            # Handle the response content safely
-            response_text = ""
-            if hasattr(response, "content") and response.content:
-                for content_block in response.content:
-                    if getattr(content_block, "type", None) == "text":
-                        text = getattr(content_block, "text", "")
-                        if text:
-                            response_text += text
-
-            if not response_text:
-                response_text = "Unable to generate response"
-
-            # Parse the response
-            result = self._parse_grading_response(response_text, student_name)
-            return result
+            return self._parse_grading_response(reply_text, student_name)
 
         except Exception as e:
             logger.error(f"Error grading submission for {student_name}: {e}")
             return {
                 "student_name": student_name,
-                "score": 0,
-                "max_score": int(self.total_points),
+                "score": 0.0,
+                "max_score": float(self.total_points),
                 "letter_grade": "ERROR",
                 "feedback": f"Error occurred during grading: {str(e)}",
                 "criterion_scores": [],
                 "raw_response": "",
             }
 
-    def _parse_grading_response(self, response_text: str, student_name: str) -> Dict:
-        """Parse Claude's grading response into structured data"""
+    # Keep a simple wrapper in case other code expects this name.
+    def parse_model_reply(self, reply_text: str, student_name: str) -> Dict[str, Any]:
+        return self._parse_grading_response(reply_text, student_name)
+
+    def _parse_grading_response(self, response_text: str, student_name: str) -> Dict[str, Any]:
+        """Parse model grading response into structured data"""
         try:
             # Initialize result
-            result: Dict = {
+            result: Dict[str, Any] = {
                 "student_name": student_name,
                 "score": 0.0,
                 "max_score": float(self.total_points),
@@ -313,6 +342,14 @@ OVERALL FEEDBACK: [comprehensive feedback and suggestions for improvement]
                 cleaned_feedback = re.sub(r"\b\d+/\d+\b\s*-?\s*", "", overall_feedback)
                 result["feedback"] = cleaned_feedback
 
+            # Clean overall feedback
+            result["feedback"] = self._normalize_references(result["feedback"])
+
+            # Clean each criterion justification
+            for cs in result["criterion_scores"]:
+                if isinstance(cs.get("justification"), str):
+                    cs["justification"] = self._normalize_references(cs["justification"])
+
             return result
 
         except Exception as e:
@@ -327,15 +364,40 @@ OVERALL FEEDBACK: [comprehensive feedback and suggestions for improvement]
                 "criterion_scores": [],
                 "raw_response": response_text,
             }
+        
+    def _normalize_references(self, text: str) -> str:
+        """Normalize person-centric phrasing to document-centric phrasing."""
+        import re
+        if not isinstance(text, str) or not text:
+            return text
 
+        # Handle 'the student' / 'this student'
+        text = re.sub(r"\b[Tt]he student\b", "the submission", text)
+        text = re.sub(r"\b[Tt]his student\b", "this submission", text)
+
+        # Possessives: student's / student’s  → submission's
+        text = re.sub(r"\b[Ss]tudent['’]s\b", "submission's", text)
+
+        # Common variants
+        text = re.sub(r"\b[Ss]tudent work\b", "the submission", text)
+
+        # (Optional) soften accidental second-person (conservative)
+        # text = re.sub(r"\b[Yy]our\b", "the submission's", text)
+        # text = re.sub(r"\b[Yy]ou\b", "the submission", text)
+
+        return text
+    
+    # ──────────────────────────────────────────────────────────────────────
+    # Batch grading & info
+    # ──────────────────────────────────────────────────────────────────────
     def batch_grade_submissions(
         self,
         submissions: List[Tuple[str, str]],
         model: str = "claude-3-5-sonnet-20241022",
         progress_callback=None,
-    ) -> List[Dict]:
+    ) -> List[Dict[str, Any]]:
         """Grade multiple submissions"""
-        results: List[Dict] = []
+        results: List[Dict[str, Any]] = []
         total = len(submissions) if submissions else 0
 
         for i, (student_name, submission_text) in enumerate(submissions or []):
@@ -354,9 +416,9 @@ OVERALL FEEDBACK: [comprehensive feedback and suggestions for improvement]
 
         return results
 
-    def get_assignment_info(self) -> Dict:
+    def get_assignment_info(self) -> Dict[str, Any]:
         """Get comprehensive assignment information"""
-        info: Dict = {
+        info: Dict[str, Any] = {
             "assignment_key": self.assignment_key,
             "display_name": self.display_name,
             "canvas_assignment_id": self.canvas_assignment_id,
@@ -398,9 +460,7 @@ OVERALL FEEDBACK: [comprehensive feedback and suggestions for improvement]
         """Refresh course document embeddings"""
         if self.document_processor:
             course_name = self.assignment_key
-            self.document_processor.load_or_create_embeddings(
-                course_name, force_refresh=True
-            )
+            self.document_processor.load_or_create_embeddings(course_name, force_refresh=True)
             logger.info(f"Refreshed embeddings for {self.assignment_key}")
 
     def validate_configuration(self) -> List[str]:
@@ -409,13 +469,9 @@ OVERALL FEEDBACK: [comprehensive feedback and suggestions for improvement]
 
         # Check rubric
         if not self.rubric_data or not self.rubric_criteria:
-            messages.append(
-                f"Warning: No rubric found for assignment {self.canvas_assignment_id}"
-            )
+            messages.append(f"Warning: No rubric found for assignment {self.canvas_assignment_id}")
         elif self.total_points <= 0:
-            messages.append(
-                f"Error: Invalid total points for {self.assignment_key}: {self.total_points}"
-            )
+            messages.append(f"Error: Invalid total points for {self.assignment_key}: {self.total_points}")
 
         # Check course documents
         if (
@@ -423,14 +479,11 @@ OVERALL FEEDBACK: [comprehensive feedback and suggestions for improvement]
             or getattr(self.document_processor, "df", None) is None
             or len(getattr(self.document_processor, "df", [])) == 0
         ):
-            messages.append(
-                f"Warning: No course documents loaded for {self.assignment_key}"
-            )
+            messages.append(f"Warning: No course documents loaded for {self.assignment_key}")
 
         # Check Canvas API configuration
         try:
             from canvas_rubric_api import load_canvas_credentials
-
             load_canvas_credentials()
         except Exception as e:
             messages.append(f"Error: Canvas API configuration issue: {e}")
