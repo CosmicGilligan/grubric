@@ -237,8 +237,9 @@ with st.sidebar:
         },
         # in rubric_grade_ui.py sidebar model list
         "openai": {
-            "GPT-4o (chat/text+image)": "gpt-4o",
-            "GPT-4o mini (fast/cheap)": "gpt-4o-mini",
+            "GPT-4o (latest)": "chatgpt-4o-latest",
+            "GPT-4o mini": "gpt-4o-mini",
+            "GPT-4 Turbo": "gpt-4-turbo",
         },
         "google": {
             "Gemini 1.5 Pro": "gemini-1.5-pro",
@@ -362,7 +363,7 @@ def run_grading_process(handler, entryList, model, total_points):
             result = handler.grade_submission(submission_text, student_name, model)
             results.append(result)
 
-            logger.info(f"Graded {student_name}: {result['score']}/{result['max_score']} ({result['letter_grade']})")
+            logger.info(f"Graded {student_name}: {result['score']}/{result['max_score']})")
 
         current_student.empty()
         stop_container.empty()
@@ -371,8 +372,8 @@ def run_grading_process(handler, entryList, model, total_points):
 
         for i, result in enumerate(results):
             if i < len(entryList):
-                feedback = f"{result['score']}/{result['max_score']} ({result['letter_grade']}) - {result['feedback']}"
-                entryList[i][2] = feedback
+                # Feedback already formatted by handler, use as-is
+                entryList[i][2] = result['feedback']
 
         submissions_dir = config.get_path('submissions_directory', './submissions/')
         os.makedirs(submissions_dir, exist_ok=True)
@@ -386,17 +387,24 @@ def run_grading_process(handler, entryList, model, total_points):
 
         if results:
             avg_score = sum(r['score'] for r in results) / len(results)
-            grade_distribution: Dict[str, int] = {}
-            for r in results:
-                grade_distribution[r['letter_grade']] = grade_distribution.get(r['letter_grade'], 0) + 1
+            total_points = results[0]['max_score'] if results else 100
+            
+            # Calculate score ranges instead of letter grades
+            score_ranges = {
+                'A (90%+)': sum(1 for r in results if r['score'] >= r['max_score'] * 0.9),
+                'B (80-89%)': sum(1 for r in results if r['max_score'] * 0.8 <= r['score'] < r['max_score'] * 0.9),
+                'C (70-79%)': sum(1 for r in results if r['max_score'] * 0.7 <= r['score'] < r['max_score'] * 0.8),
+                'D (60-69%)': sum(1 for r in results if r['max_score'] * 0.6 <= r['score'] < r['max_score'] * 0.7),
+                'F (<60%)': sum(1 for r in results if r['score'] < r['max_score'] * 0.6)
+            }
 
             st.success(f"Completed! Average score: {avg_score:.1f}/{total_points}")
             col_a, col_b, col_c, col_d, col_f = st.columns(5)
-            with col_a: st.metric("A's", grade_distribution.get('A', 0))
-            with col_b: st.metric("B's", grade_distribution.get('B', 0))
-            with col_c: st.metric("C's", grade_distribution.get('C', 0))
-            with col_d: st.metric("D's", grade_distribution.get('D', 0))
-            with col_f: st.metric("F's", grade_distribution.get('F', 0))
+            with col_a: st.metric("A's", score_ranges['A (90%+)'])
+            with col_b: st.metric("B's", score_ranges['B (80-89%)'])
+            with col_c: st.metric("C's", score_ranges['C (70-79%)'])
+            with col_d: st.metric("D's", score_ranges['D (60-69%)'])
+            with col_f: st.metric("F's", score_ranges['F (<60%)'])
 
         st.balloons()
     except Exception as e:

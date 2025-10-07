@@ -244,6 +244,12 @@ class RubricAssignmentHandler:
                 max_tokens=1200,
             )
 
+            # DEBUG: Print raw response
+            logger.info(f"RAW AI RESPONSE for {student_name}:")
+            logger.info(reply_text)
+            logger.info("=" * 80)
+
+
             return self._parse_grading_response(reply_text, student_name)
 
         except Exception as e:
@@ -265,12 +271,11 @@ class RubricAssignmentHandler:
     def _parse_grading_response(self, response_text: str, student_name: str) -> Dict[str, Any]:
         """Parse model grading response into structured data"""
         try:
-            # Initialize result
+            # Initialize result WITHOUT letter_grade
             result: Dict[str, Any] = {
                 "student_name": student_name,
                 "score": 0.0,
                 "max_score": float(self.total_points),
-                "letter_grade": "F",
                 "feedback": response_text,
                 "criterion_scores": [],
                 "raw_response": response_text,
@@ -298,25 +303,8 @@ class RubricAssignmentHandler:
                     result["score"] = total_earned
                     result["max_score"] = total_possible
 
-            # Convert to letter grade
-            if result["max_score"] > 0:
-                percentage = (result["score"] / result["max_score"]) * 100.0
-                if percentage >= 90:
-                    result["letter_grade"] = "A"
-                elif percentage >= 80:
-                    result["letter_grade"] = "B"
-                elif percentage >= 70:
-                    result["letter_grade"] = "C"
-                elif percentage >= 60:
-                    result["letter_grade"] = "D"
-                else:
-                    result["letter_grade"] = "F"
-
             # Extract individual criterion scores and justifications
-            criterion_pattern = (
-                r"CRITERION (\d+):\s*(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)\s*-\s*"
-                r"([^C]*?(?=CRITERION \d+:|TOTAL SCORE:|OVERALL FEEDBACK:|$))"
-            )
+            criterion_pattern = r"CRITERION (\d+):\s*(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)\s*-\s*(.+?)(?=(?:CRITERION \d+:|TOTAL SCORE:|OVERALL FEEDBACK:|$))"
             criterion_matches = re.findall(
                 criterion_pattern, response_text, re.IGNORECASE | re.DOTALL
             )
@@ -332,18 +320,34 @@ class RubricAssignmentHandler:
                     }
                 )
 
-            # Extract overall feedback (grab everything until end)
+            # Extract overall feedback
             overall_feedback_match = re.search(
                 r"OVERALL FEEDBACK:\s*(.+)$", response_text, re.IGNORECASE | re.DOTALL
             )
             if overall_feedback_match:
                 overall_feedback = overall_feedback_match.group(1).strip()
-                # Clean up the feedback - remove score tokens already captured
-                cleaned_feedback = re.sub(r"\b\d+/\d+\b\s*-?\s*", "", overall_feedback)
-                result["feedback"] = cleaned_feedback
-
-            # Clean overall feedback
-            result["feedback"] = self._normalize_references(result["feedback"])
+                # Clean up the feedback - remove ALL score tokens (including ones already in the text)
+                cleaned_feedback = re.sub(r"\b\d+(?:\.\d+)?/\d+(?:\.\d+)?\b\s*-?\s*", "", overall_feedback)
+                cleaned_feedback = self._normalize_references(cleaned_feedback)
+                
+                # Only format if we haven't already formatted (avoid duplication)
+                if not cleaned_feedback.startswith(f"{result['score']}/{result['max_score']}"):
+                    # Format feedback WITH criterion breakdown (no letter grade)
+                    breakdown_str = ", ".join([str(cs["earned"]) for cs in result["criterion_scores"]])
+                    if breakdown_str:
+                        result["feedback"] = f"{result['score']}/{result['max_score']} ({breakdown_str}) - {cleaned_feedback}"
+                    else:
+                        result["feedback"] = f"{result['score']}/{result['max_score']} - {cleaned_feedback}"
+                else:
+                    # Already formatted, just use cleaned version
+                    result["feedback"] = cleaned_feedback
+            else:
+                # No overall feedback found, just use score and breakdown
+                breakdown_str = ", ".join([str(cs["earned"]) for cs in result["criterion_scores"]])
+                if breakdown_str:
+                    result["feedback"] = f"{result['score']}/{result['max_score']} ({breakdown_str}) - No detailed feedback provided"
+                else:
+                    result["feedback"] = f"{result['score']}/{result['max_score']} - No detailed feedback provided"
 
             # Clean each criterion justification
             for cs in result["criterion_scores"]:
@@ -408,7 +412,7 @@ class RubricAssignmentHandler:
             results.append(result)
 
             logger.info(
-                f"Graded {student_name}: {result['score']}/{result['max_score']} ({result['letter_grade']})"
+                f"Graded {student_name}: {result['score']}/{result['max_score']})"
             )
 
         if progress_callback:
