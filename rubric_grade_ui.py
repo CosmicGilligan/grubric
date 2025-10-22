@@ -18,7 +18,7 @@ import requests
 from pathlib import Path
 
 # Import components
-from canvas_rubric_api import CanvasRubricAPI   # (do not import load_canvas_credentials to avoid name clash)
+from canvas_rubric_api import CanvasRubricAPI
 from course_document_processor import CourseDocumentProcessor
 from rubric_assignment_handler import RubricAssignmentHandler
 import grade_all
@@ -33,23 +33,17 @@ from llm_provider import make_llm
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────────────────
-# Grade upload helpers (Canvas API) — fixed (no walrus)
-# ─────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# Grade upload helpers (Canvas API)
+# ═══════════════════════════════════════════════════════════════════════════
 import re
 from typing import Tuple, Any, Dict, List, Optional
 
-_UID_ANYWHERE = re.compile(r"(\d{4,})")  # grabs a 4+ digit id anywhere in the label
+_UID_ANYWHERE = re.compile(r"(\d{4,})")
 _SCORE_RE = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*/\s*([0-9]+(?:\.[0-9]+)?)")
 
 def extract_user_id_from_label(label: str) -> Optional[int]:
-    """
-    Works for labels like:
-     - 'Smith, Jane - 9051950'
-     - 'blancoerick_9051950_text.html'
-     - 'Doe, John (1234567)'
-    Returns int user_id or None.
-    """
+    """Extract Canvas user_id from label"""
     if not isinstance(label, str):
         return None
     m = _UID_ANYWHERE.search(label)
@@ -59,16 +53,13 @@ def extract_user_id_from_label(label: str) -> Optional[int]:
         return None
 
 def parse_score_and_comment(feedback: str) -> Tuple[Optional[float], Optional[float], str]:
-    """
-    Feedback looks like: '8.5/12.0 (C) - Some comment text...'
-    Returns (score, max_points, comment_text). If no score found, score=None.
-    """
+    """Parse feedback string into score, max_points, and comment"""
     if not isinstance(feedback, str):
         return None, None, ""
     score: Optional[float] = None
     max_pts: Optional[float] = None
 
-    m = _SCORE_RE.match(feedback)  # ← fixed (no walrus)
+    m = _SCORE_RE.match(feedback)
     if m:
         try:
             score = float(m.group(1))
@@ -77,7 +68,6 @@ def parse_score_and_comment(feedback: str) -> Tuple[Optional[float], Optional[fl
             score = None
             max_pts = None
 
-    # comment = text after the first ' - ' if present, else whole feedback
     dash_idx = feedback.find(" - ")
     comment = feedback[dash_idx + 3:] if dash_idx != -1 else feedback
     return score, max_pts, comment.strip()
@@ -91,11 +81,7 @@ def upload_grade_and_comment(
     score: Optional[float],
     comment: str
 ) -> Dict[str, Any]:
-    """
-    PUT /courses/:course_id/assignments/:assignment_id/submissions/:user_id
-      - submission[posted_grade]: numeric points or letter (we send points)
-      - comment[text_comment]: feedback
-    """
+    """Upload a single grade and comment to Canvas"""
     import requests
     headers = {"Authorization": f"Bearer {token}"}
     url = f"{api_base}/courses/{course_id}/assignments/{assignment_id}/submissions/{user_id}"
@@ -115,10 +101,7 @@ def upload_all_grades(
     assignment_id: int,
     entry_list: List[List[str]],
 ) -> Tuple[int, int, List[Tuple[str, str]]]:
-    """
-    entry_list rows look like: [student_label, submission_text, feedback]
-    Returns: (success_count, fail_count, failures[(label, reason)])
-    """
+    """Upload all grades from entry_list"""
     successes = 0
     failures: List[Tuple[str, str]] = []
     for row in entry_list:
@@ -136,10 +119,9 @@ def upload_all_grades(
             failures.append((row[0] if row else "<unknown>", str(e)))
     return successes, len(failures), failures
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Credentials (reads ~/canvas-secrets.key, normalizes API base once)
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# Credentials
+# ═══════════════════════════════════════════════════════════════════════════
 def _normalize_api_url(url: str) -> str:
     url = url.rstrip("/")
     if url.endswith("/api/v1"):
@@ -155,20 +137,20 @@ def load_canvas_credentials_local() -> Tuple[str, str]:
     token = lines[1]
     return api_base, token
 
-# initialize once (stash in session_state)
+# Initialize credentials once
 if "canvas_url" not in st.session_state or "canvas_token" not in st.session_state:
     try:
         st.session_state.canvas_url, st.session_state.canvas_token = load_canvas_credentials_local()
     except Exception as e:
         st.error(str(e))
         st.stop()
-canvas_url = st.session_state.canvas_url       # already normalized to .../api/v1
+canvas_url = st.session_state.canvas_url
 token = st.session_state.canvas_token
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 # Helpers for rubric fetching and state gating
-# ──────────────────────────────────────────────────────────────────────────────
-from typing import List as _List, Dict as _Dict  # avoid confusion in hints below
+# ═══════════════════════════════════════════════════════════════════════════
+from typing import List as _List, Dict as _Dict
 
 def fetch_assignment_rubric(api_base: str, token: str, course_id: int, assignment_id: int) -> Optional[_List[_Dict[str, Any]]]:
     """Return the Canvas rubric as a list of criterion dicts, or None if none is attached."""
@@ -185,15 +167,19 @@ def fetch_assignment_rubric(api_base: str, token: str, course_id: int, assignmen
 
 def _init_state():
     st.session_state.setdefault("assignment_handler", None)
-    st.session_state.setdefault("rubric", None)                     # Optional[List[Dict[str, Any]]]
-    st.session_state.setdefault("rubric_loaded_for", None)          # (course_id, assignment_id)
+    st.session_state.setdefault("rubric", None)
+    st.session_state.setdefault("rubric_loaded_for", None)
     st.session_state.setdefault("rubric_total_points", 0.0)
 
     st.session_state.setdefault("entryList", [])
-    st.session_state.setdefault("submissions_ready_for", None)      # (course_id, assignment_id)
+    st.session_state.setdefault("submissions_ready_for", None)
+    st.session_state.setdefault("student_metadata", {})
+    st.session_state.setdefault("original_entries", {})
 
     st.session_state.setdefault("ready_to_grade", False)
     st.session_state.setdefault("stop_processing", False)
+    st.session_state.setdefault("grading_mode", "all")
+    st.session_state.setdefault("selected_students", set())
 
 def _recompute_ready_flag():
     st.session_state.ready_to_grade = (
@@ -203,9 +189,9 @@ def _recompute_ready_flag():
         and bool(st.session_state.entryList)
     )
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 # Page configuration
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 st.set_page_config(
     page_title="Dynamic Rubric Grading",
     page_icon="🎯",
@@ -214,13 +200,13 @@ st.set_page_config(
 )
 _init_state()
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Provider & Model selection (NEW)
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# Provider & Model selection
+# ═══════════════════════════════════════════════════════════════════════════
 @st.cache_resource
 def get_llm_cached(provider: str):
     """Create and cache a provider-agnostic LLM wrapper for the selected provider."""
-    raw = get_client(provider)  # reads ~/anthropic.key, ~/openai.key, ~/genai.key
+    raw = get_client(provider)
     return make_llm(provider, raw)
 
 st.markdown("## Dynamic Rubric-Based Grading System")
@@ -235,7 +221,6 @@ with st.sidebar:
             "Claude 3 Opus": "claude-3-opus-20240229",
             "Claude 3 Haiku": "claude-3-haiku-20240307",
         },
-        # in rubric_grade_ui.py sidebar model list
         "openai": {
             "GPT-4o (latest)": "chatgpt-4o-latest",
             "GPT-4o mini": "gpt-4o-mini",
@@ -251,9 +236,9 @@ with st.sidebar:
 
 llm = get_llm_cached(provider)
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 # Configuration management
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 class DynamicRubricConfig:
     def __init__(self, config_file="config_rubric.ini"):
         self.config_file = config_file
@@ -313,12 +298,11 @@ class DynamicRubricConfig:
                     history.append((name, assignment_id, course_id))
         return history
 
-# Initialize configuration
 config = DynamicRubricConfig()
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 # Initialize Canvas API client
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 @st.cache_resource
 def get_canvas_api():
     try:
@@ -330,11 +314,19 @@ def get_canvas_api():
 
 canvas_api = get_canvas_api()
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 # Grading runner
-# ──────────────────────────────────────────────────────────────────────────────
-def run_grading_process(handler, entryList, model, total_points):
-    """Perform the grading process"""
+# ═══════════════════════════════════════════════════════════════════════════
+def run_grading_process(handler, entryList, model, total_points, mode="all"):
+    """Perform the grading process
+    
+    Args:
+        handler: RubricAssignmentHandler instance
+        entryList: List of entries to grade (already filtered if mode="selective")
+        model: Model name to use
+        total_points: Total points for the assignment
+        mode: "all" or "selective"
+    """
     progress_bar = st.progress(0)
     status_text = st.empty()
     current_student = st.empty()
@@ -370,18 +362,41 @@ def run_grading_process(handler, entryList, model, total_points):
         progress_bar.progress(1.0)
         status_text.text("Grading completed!")
 
+        # Update entryList with new feedback
         for i, result in enumerate(results):
             if i < len(entryList):
-                # Feedback already formatted by handler, use as-is
                 entryList[i][2] = result['feedback']
 
+        # Merge with original entries if selective grading
+        final_entry_list = []
+        if mode == "selective":
+            # Create a map of graded entries
+            graded_map = {}
+            for entry in entryList:
+                user_id = extract_user_id_from_label(entry[0])
+                if user_id:
+                    graded_map[str(user_id)] = entry
+            
+            # Build final list: use graded version if available, otherwise original
+            for user_id, original_entry in st.session_state.original_entries.items():
+                if user_id in graded_map:
+                    final_entry_list.append(graded_map[user_id])
+                else:
+                    final_entry_list.append(original_entry)
+            
+            preserved_count = len(final_entry_list) - len(graded_map)
+            st.info(f"✓ Merged results: {len(graded_map)} newly graded + {preserved_count} preserved with original grades/feedback")
+        else:
+            final_entry_list = entryList
+
+        # Write to CSV
         submissions_dir = config.get_path('submissions_directory', './submissions/')
         os.makedirs(submissions_dir, exist_ok=True)
         filename = os.path.join(submissions_dir, 'completions.csv')
 
         with open(filename, 'w+', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerows(entryList)
+            writer.writerows(final_entry_list)
 
         create_xlsx(filename)
 
@@ -389,7 +404,7 @@ def run_grading_process(handler, entryList, model, total_points):
             avg_score = sum(r['score'] for r in results) / len(results)
             total_points = results[0]['max_score'] if results else 100
             
-            # Calculate score ranges instead of letter grades
+            # Calculate score ranges
             score_ranges = {
                 'A (90%+)': sum(1 for r in results if r['score'] >= r['max_score'] * 0.9),
                 'B (80-89%)': sum(1 for r in results if r['max_score'] * 0.8 <= r['score'] < r['max_score'] * 0.9),
@@ -398,7 +413,11 @@ def run_grading_process(handler, entryList, model, total_points):
                 'F (<60%)': sum(1 for r in results if r['score'] < r['max_score'] * 0.6)
             }
 
-            st.success(f"Completed! Average score: {avg_score:.1f}/{total_points}")
+            if mode == "selective":
+                st.success(f"Completed! Graded {len(results)} selected submissions. Average score: {avg_score:.1f}/{total_points}")
+            else:
+                st.success(f"Completed! Average score: {avg_score:.1f}/{total_points}")
+            
             col_a, col_b, col_c, col_d, col_f = st.columns(5)
             with col_a: st.metric("A's", score_ranges['A (90%+)'])
             with col_b: st.metric("B's", score_ranges['B (80-89%)'])
@@ -411,9 +430,9 @@ def run_grading_process(handler, entryList, model, total_points):
         st.error(f"Error during grading: {e}")
         logger.error(f"Grading error: {e}")
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 # UI
-# ──────────────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 st.subheader("Step 1: Select Course")
 courses = config.get_courses()
 if not courses:
@@ -468,15 +487,14 @@ if assignment_id and st.button("Load Assignment Rubric", type="primary"):
                 canvas_assignment_id=assignment_id,
                 course_id=selected_course_id,
                 course_documents_path=documents_path,
-                # CHANGED: pass unified LLM instead of Anthropic-specific client
                 llm=llm
             )
             st.session_state.assignment_handler = handler
 
-            # Fetch rubric JSON from Canvas so we know total points and criteria
+            # Fetch rubric JSON from Canvas
             rubric_items = fetch_assignment_rubric(canvas_url, token, int(selected_course_id), int(assignment_id))
             if rubric_items is not None:
-                st.session_state.rubric = rubric_items  # List[Dict[str, Any]]
+                st.session_state.rubric = rubric_items
                 st.session_state.rubric_total_points = float(sum((c.get("points") or 0) for c in rubric_items))
                 st.session_state.rubric_loaded_for = (int(selected_course_id), int(assignment_id))
                 st.success("Rubric loaded.")
@@ -494,7 +512,7 @@ if assignment_id and st.button("Load Assignment Rubric", type="primary"):
             st.error(f"Error loading assignment: {e}")
             logger.error(f"Assignment loading error: {e}")
 
-# Step 3.5: Assignment Overview (only if rubric is loaded)
+# Step 3.5: Assignment Overview
 if st.session_state.rubric is not None and st.session_state.assignment_handler:
     handler = st.session_state.assignment_handler
     rubric_items = cast(List[Dict[str, Any]], st.session_state.rubric)
@@ -522,28 +540,57 @@ if st.session_state.rubric is not None and st.session_state.assignment_handler:
             if isinstance(ld, str) and ld.strip():
                 st.caption(ld)
 
-# Step 4: Load Submissions  (single block)
+# Step 4: Load Submissions
 st.subheader("Step 4: Load Submissions")
 if assignment_id and st.button("Download submissions from Canvas"):
-    with st.spinner("Downloading submissions..."):
+    with st.spinner("Clearing submissions folder and downloading..."):
         course_id = int(selected_course_id)
         asg_id = int(assignment_id)
-        students, files = download_submissions_flat(
-            canvas_base_url=canvas_url,     # normalized base
+        students, files, metadata = download_submissions_flat(
+            canvas_base_url=canvas_url,
             token=token,
             course_id=course_id,
             assignment_id=asg_id,
             dest_dir="./submissions",
             clean_dest=True
         )
-        # Build the entry list immediately so the grader can open
         st.session_state.entryList = grade_all.makeEntryList(selected_course_id)
         st.session_state.submissions_ready_for = (course_id, asg_id)
-        st.success(f"Pulled {files} files for {students} students into ./submissions")
+        st.session_state.student_metadata = metadata
+        
+        # Store original entries with existing grades/feedback
+        st.session_state.original_entries = {}
+        for entry in st.session_state.entryList:
+            student_label = entry[0]
+            user_id = extract_user_id_from_label(student_label)
+            if user_id and str(user_id) in metadata:
+                meta = metadata[str(user_id)]
+                existing_feedback = ""
+                
+                if meta.get('current_score') is not None:
+                    score = meta['current_score']
+                    max_pts = st.session_state.get('rubric_total_points', 12.0)
+                    feedback_text = meta.get('current_feedback', '')
+                    if feedback_text:
+                        existing_feedback = f"{score}/{max_pts} - {feedback_text}"
+                    else:
+                        existing_feedback = f"{score}/{max_pts} - Previously graded"
+                elif meta.get('current_grade'):
+                    existing_feedback = f"{meta['current_grade']} - Previously graded"
+                
+                original_entry = entry.copy()
+                if existing_feedback:
+                    original_entry[2] = existing_feedback
+                st.session_state.original_entries[str(user_id)] = original_entry
+            else:
+                st.session_state.original_entries[str(user_id)] = entry.copy()
+        
+        st.success(f"✓ Cleared old files and pulled {files} new files for {students} students")
+        st.info("✓ Captured existing grades and feedback for preservation")
         _recompute_ready_flag()
         st.rerun()
 
-# Optional manual refresh (does not re-download, just rescans the folder)
+# Optional manual refresh
 if st.button("Refresh Submissions"):
     st.session_state.entryList = grade_all.makeEntryList(selected_course_id)
     if assignment_id:
@@ -551,21 +598,135 @@ if st.button("Refresh Submissions"):
     _recompute_ready_flag()
     st.success(f"Refreshed: {len(st.session_state.entryList)} submissions loaded")
 
-# Step 5: Grade Submissions (only when both rubric & submissions match the same assignment)
+# Step 4.5: Select Grading Mode
+if st.session_state.ready_to_grade and st.session_state.entryList:
+    st.subheader("Step 4.5: Choose Grading Mode")
+    
+    grading_mode = st.radio(
+        "Select grading approach:",
+        ["Grade all submissions", "Select specific submissions to grade"],
+        index=0 if st.session_state.grading_mode == "all" else 1,
+        horizontal=True
+    )
+    
+    if grading_mode == "Grade all submissions":
+        st.session_state.grading_mode = "all"
+        st.session_state.selected_students = set()
+        st.info(f"✓ All {len(st.session_state.entryList)} submissions will be graded")
+    
+    else:  # Select specific submissions
+        st.session_state.grading_mode = "selective"
+        st.markdown("**Select students to grade:**")
+        st.info("💡 **Tip:** Unselected students will keep their existing grades and feedback. Only selected students will be re-graded.")
+        
+        # Build selection data
+        selection_data = []
+        for entry in st.session_state.entryList:
+            student_label = entry[0]
+            user_id = extract_user_id_from_label(student_label)
+            
+            if user_id and str(user_id) in st.session_state.student_metadata:
+                meta = st.session_state.student_metadata[str(user_id)]
+                current_grade = meta.get('current_grade') or meta.get('current_score')
+                if current_grade is None:
+                    current_grade = "Not graded"
+                elif isinstance(current_grade, float):
+                    current_grade = f"{current_grade:.1f}"
+                
+                # Check if there's existing feedback
+                has_feedback = bool(meta.get('current_feedback'))
+                grade_display = f"{current_grade} {'📝' if has_feedback else ''}"
+                
+                selection_data.append({
+                    'user_id': str(user_id),
+                    'Student': meta.get('name', student_label),
+                    'Current Grade': grade_display,
+                    'Submitted': meta.get('submission_date', 'N/A')
+                })
+            else:
+                selection_data.append({
+                    'user_id': str(user_id) if user_id else 'unknown',
+                    'Student': student_label,
+                    'Current Grade': 'Unknown',
+                    'Submitted': 'N/A'
+                })
+        
+        if selection_data:
+            st.caption("📝 = Has existing feedback that will be preserved if not re-graded")
+            
+            # Create checkboxes for each student
+            cols = st.columns([1, 4, 2, 2])
+            with cols[0]: st.markdown("**Select**")
+            with cols[1]: st.markdown("**Student**")
+            with cols[2]: st.markdown("**Current Grade**")
+            with cols[3]: st.markdown("**Submitted**")
+            
+            # Add "Select All" / "Deselect All" buttons
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button("Select All"):
+                    st.session_state.selected_students = {s['user_id'] for s in selection_data}
+                    st.rerun()
+            with col_b:
+                if st.button("Deselect All"):
+                    st.session_state.selected_students = set()
+                    st.rerun()
+            
+            st.markdown("---")
+            
+            for student_info in selection_data:
+                cols = st.columns([1, 4, 2, 2])
+                user_id = student_info['user_id']
+                
+                with cols[0]:
+                    is_checked = user_id in st.session_state.selected_students
+                    if st.checkbox("", value=is_checked, key=f"select_{user_id}", label_visibility="collapsed"):
+                        st.session_state.selected_students.add(user_id)
+                    else:
+                        st.session_state.selected_students.discard(user_id)
+                
+                with cols[1]: st.write(student_info['Student'])
+                with cols[2]: st.write(student_info['Current Grade'])
+                with cols[3]: st.write(student_info['Submitted'][:10] if student_info['Submitted'] != 'N/A' else 'N/A')
+            
+            selected_count = len(st.session_state.selected_students)
+            if selected_count > 0:
+                st.success(f"✓ {selected_count} student(s) selected for grading")
+            else:
+                st.warning("⚠ No students selected. Please select at least one student to grade.")
+        else:
+            st.error("No submission data available for selection")
+
+# Step 5: Grade Submissions
 if st.session_state.ready_to_grade:
     st.subheader("Step 5: Grade Submissions")
     entryList = st.session_state.entryList
     handler = st.session_state.assignment_handler
     total_points = st.session_state.rubric_total_points or handler.total_points
 
-    st.info(f"Ready to grade {len(entryList)} submissions using **{provider} → {selected_model}**")
+    # Filter entries based on grading mode
+    if st.session_state.grading_mode == "selective":
+        if not st.session_state.selected_students:
+            st.warning("⚠ Please select at least one student to grade in Step 4.5")
+        else:
+            entries_to_grade = [
+                entry for entry in entryList 
+                if extract_user_id_from_label(entry[0]) and 
+                str(extract_user_id_from_label(entry[0])) in st.session_state.selected_students
+            ]
+            st.info(f"Ready to grade {len(entries_to_grade)} selected submissions (out of {len(entryList)} total) using **{provider} → {selected_model}**")
+            
+            if st.button("Start Grading Selected", type="primary"):
+                run_grading_process(handler, entries_to_grade, selected_model, total_points, mode="selective")
+    else:
+        st.info(f"Ready to grade {len(entryList)} submissions using **{provider} → {selected_model}**")
+        
+        if st.button("Start Grading All", type="primary"):
+            run_grading_process(handler, entryList, selected_model, total_points, mode="all")
 
-    if st.button("Start Grading", type="primary"):
-        run_grading_process(handler, entryList, selected_model, total_points)
-
-# ─────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 # Step 6: Upload Grades & Comments to Canvas
-# ─────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
 from grade_uploader import upload_all_from_entrylist, upload_all_from_xlsx
 
 st.subheader("Step 6: Upload Grades to Canvas")

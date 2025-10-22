@@ -2,8 +2,11 @@
 from __future__ import annotations
 import os, re, shutil, html
 import requests
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 def _normalize_api_base(raw_base: str) -> str:
     base = raw_base.strip().rstrip("/")
@@ -73,34 +76,48 @@ def download_submissions_flat(
     assignment_id: int,
     dest_dir: str = "./submissions",
     clean_dest: bool = True
-) -> Tuple[int, int]:
+) -> Tuple[int, int, Dict[str, Dict[str, Any]]]:
     """
     Downloads submissions to a FLAT folder like:
       ./submissions/blancoerick_9051950_text.html
       ./submissions/blancoerick_9051950_essay.docx
       ./submissions/blancoerick_9051950_url.txt
-    Returns: (num_students_processed, num_files_saved)
+    Returns: (num_students_processed, num_files_saved, student_metadata)
+    
+    student_metadata is a dict keyed by user_id with:
+      {
+        'name': 'Last, First',
+        'current_score': float or None,
+        'current_grade': str or None,
+        'current_feedback': str,
+        'submission_date': str or None
+      }
     """
     api_base = _normalize_api_base(canvas_base_url)
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
     if clean_dest:
-        # remove existing files only (not the folder)
-        for p in dest.glob("*"):
-            if p.is_file():
-                try: p.unlink()
-                except Exception: pass
+        # Remove all existing files and subdirectories
+        for p in dest.iterdir():
+            try:
+                if p.is_file():
+                    p.unlink()
+                elif p.is_dir():
+                    shutil.rmtree(p)
+            except Exception as e:
+                logger.warning(f"Could not remove {p}: {e}")
 
     session = requests.Session()
     session.headers.update({"Authorization": f"Bearer {token}"})
 
-    # include user + attachments
+    # include user + attachments + submission comments
     url = f"{api_base}/courses/{course_id}/assignments/{assignment_id}/submissions"
-    params = {"per_page": 100, "include[]": ["user", "attachments"]}
+    params = {"per_page": 100, "include[]": ["user", "attachments", "submission_comments"]}
     submissions = _get_with_pagination(session, url, params)
 
     students = 0
     files_saved = 0
+    student_metadata: Dict[str, Dict[str, Any]] = {}
 
     for sub in submissions:
         state = sub.get("workflow_state")
@@ -113,6 +130,31 @@ def download_submissions_flat(
             # can't construct exact filename without id; skip safely
             continue
         stem = f"{_student_stem(user)}_{user_id}"
+        
+        # Capture student metadata
+        sortable_name = user.get("sortable_name") or user.get("name") or f"Student {user_id}"
+        current_score = sub.get("score")  # Can be None if not graded yet
+        current_grade = sub.get("grade")  # String grade (could be letter or points)
+        submission_date = sub.get("submitted_at")
+        
+        # Capture existing feedback/comments
+        current_feedback = ""
+        submission_comments = sub.get("submission_comments") or []
+        if submission_comments:
+            # Get the most recent comment (they're usually in chronological order)
+            # Filter out student comments, only get grader comments
+            grader_comments = [c for c in submission_comments if c.get("author_id") != user_id]
+            if grader_comments:
+                latest_comment = grader_comments[-1]  # Most recent
+                current_feedback = latest_comment.get("comment") or ""
+        
+        student_metadata[str(user_id)] = {
+            'name': sortable_name,
+            'current_score': float(current_score) if current_score is not None else None,
+            'current_grade': str(current_grade) if current_grade else None,
+            'current_feedback': current_feedback,
+            'submission_date': submission_date
+        }
 
         # 1) online text entry (HTML body)
         body = sub.get("body")
@@ -145,10 +187,10 @@ def download_submissions_flat(
                                 f.write(chunk)
                 files_saved += 1
             else:
-                # No direct URL (e.g., cloud LTI) — record metadata
+                # No direct URL (e.g., cloud LTI) – record metadata
                 out_path.with_suffix(".json").write_text(str(att), encoding="utf-8", errors="ignore")
                 files_saved += 1
 
         students += 1
 
-    return students, files_saved
+    return students, files_saved, student_metadata
