@@ -246,10 +246,20 @@ def get_rubric_for_assignment(course_id: str, assignment_id: str) -> Dict:
         rubric_raw = assignment_data.get('rubric', [])
         rubric_criteria = canvas_api.parse_rubric_criteria(rubric_raw)
         
+        # Use points_possible from Canvas assignment, not sum of rubric criteria
+        points_possible = assignment_data.get('points_possible')
+        if points_possible is not None:
+            total_points = float(points_possible)
+            logger.info(f"Using Canvas assignment points_possible: {total_points}")
+        else:
+            # Fallback to calculating from rubric if points_possible not available
+            total_points = canvas_api.get_rubric_total_points(rubric_criteria)
+            logger.warning(f"points_possible not found, calculated from rubric criteria: {total_points}")
+        
         return {
             'assignment': assignment_data,
             'rubric_criteria': rubric_criteria,
-            'total_points': canvas_api.get_rubric_total_points(rubric_criteria),
+            'total_points': total_points,
             'formatted_rubric': canvas_api.format_rubric_for_grading(rubric_criteria)
         }
         

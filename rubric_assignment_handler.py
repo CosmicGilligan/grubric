@@ -85,6 +85,26 @@ class RubricAssignmentHandler:
             if self.rubric_data:
                 self.rubric_criteria = self.rubric_data.get("rubric_criteria", [])
                 self.total_points = float(self.rubric_data.get("total_points", 100))
+                
+                # Check if rubric criteria points need scaling
+                rubric_sum = sum(float(c.get("points", 0)) for c in self.rubric_criteria)
+                if rubric_sum > 0 and abs(rubric_sum - self.total_points) > 0.01:
+                    # Rubric criteria sum doesn't match assignment total - need to scale
+                    scale_factor = self.total_points / rubric_sum
+                    logger.info(f"Scaling rubric criteria: {rubric_sum} points -> {self.total_points} points (factor: {scale_factor:.3f})")
+                    
+                    # Scale all criterion points and rating points
+                    for criterion in self.rubric_criteria:
+                        original_points = float(criterion.get("points", 0))
+                        criterion["points"] = original_points * scale_factor
+                        criterion["original_points"] = original_points  # Keep original for reference
+                        
+                        # Scale rating points too
+                        for rating in criterion.get("ratings", []):
+                            original_rating_points = float(rating.get("points", 0))
+                            rating["points"] = original_rating_points * scale_factor
+                            rating["original_points"] = original_rating_points
+                
                 logger.info(
                     f"Loaded rubric with {len(self.rubric_criteria)} criteria, {self.total_points} total points"
                 )
@@ -124,7 +144,32 @@ class RubricAssignmentHandler:
                 f"Grade this submission out of {int(self.total_points)} points based on "
                 "quality, accuracy, and completeness."
             )
-        return self.rubric_data.get("formatted_rubric", "")
+        
+        # Format rubric with (possibly scaled) criterion points
+        rubric_text = f"Grade this submission out of {self.total_points} total points using the following rubric:\n\n"
+        
+        for i, criterion in enumerate(self.rubric_criteria, 1):
+            points = criterion.get('points', 0)
+            desc = criterion.get('description', 'Criterion')
+            rubric_text += f"CRITERION {i}: {desc} ({points:.1f} points)\n"
+            
+            long_desc = criterion.get('long_description', '')
+            if long_desc:
+                rubric_text += f"Details: {long_desc}\n"
+            
+            rubric_text += "Rating Scale:\n"
+            for rating in criterion.get('ratings', []):
+                rating_desc = rating.get('description', '')
+                rating_points = rating.get('points', 0)
+                rubric_text += f"  - {rating_desc} ({rating_points:.1f} pts)"
+                rating_long = rating.get('long_description', '')
+                if rating_long:
+                    rubric_text += f": {rating_long}"
+                rubric_text += "\n"
+            
+            rubric_text += "\n"
+        
+        return rubric_text
 
     def search_relevant_documents(
         self, submission_text: str, query_terms: Optional[List[str]] = None
@@ -191,6 +236,8 @@ class RubricAssignmentHandler:
     {submission_text}
 
     GRADING INSTRUCTIONS:
+    IMPORTANT: This assignment is worth {self.total_points} TOTAL POINTS. Calculate the total score out of {self.total_points}.
+    
     1. Evaluate the submission against each rubric criterion
     2. Use the course materials as context to assess accuracy and depth
     3. For each criterion, provide:
@@ -203,7 +250,7 @@ class RubricAssignmentHandler:
     CRITERION 1: [earned_points]/[max_points] - [detailed justification]
     CRITERION 2: [earned_points]/[max_points] - [detailed justification]
     ...
-    TOTAL SCORE: [total_earned]/[total_possible]
+    TOTAL SCORE: [total_earned]/{self.total_points}
     OVERALL FEEDBACK: [comprehensive feedback and suggestions for improvement]
     """
         return prompt
@@ -289,7 +336,9 @@ class RubricAssignmentHandler:
             )
             if total_match:
                 result["score"] = float(total_match.group(1))
-                result["max_score"] = float(total_match.group(2))
+                # Always use self.total_points, not what the LLM said
+                # (LLM might mistakenly use 100 even though we told it to use 50)
+                result["max_score"] = float(self.total_points)
             else:
                 # Try to sum individual criterion scores
                 criterion_matches = re.findall(
@@ -299,9 +348,9 @@ class RubricAssignmentHandler:
                 )
                 if criterion_matches:
                     total_earned = sum(float(match[0]) for match in criterion_matches)
-                    total_possible = sum(float(match[1]) for match in criterion_matches)
+                    # Use self.total_points as max, not sum of criterion max values
                     result["score"] = total_earned
-                    result["max_score"] = total_possible
+                    result["max_score"] = float(self.total_points)
 
             # Extract individual criterion scores and justifications
             criterion_pattern = r"CRITERION (\d+):\s*(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)\s*-\s*(.+?)(?=(?:CRITERION \d+:|TOTAL SCORE:|OVERALL FEEDBACK:|$))"
@@ -324,6 +373,12 @@ class RubricAssignmentHandler:
             overall_feedback_match = re.search(
                 r"OVERALL FEEDBACK:\s*(.+)$", response_text, re.IGNORECASE | re.DOTALL
             )
+            
+            # Check if we successfully extracted a score
+            if result["score"] == 0.0 and not result["criterion_scores"]:
+                logger.warning(f"Could not extract score from response for {student_name}. Response may be malformed.")
+                logger.warning(f"Response text: {response_text[:500]}...")
+            
             if overall_feedback_match:
                 overall_feedback = overall_feedback_match.group(1).strip()
                 # Clean up the feedback - remove ALL score tokens (including ones already in the text)

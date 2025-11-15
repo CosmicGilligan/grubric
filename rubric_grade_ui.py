@@ -147,29 +147,123 @@ if "canvas_url" not in st.session_state or "canvas_token" not in st.session_stat
 canvas_url = st.session_state.canvas_url
 token = st.session_state.canvas_token
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Helpers for rubric fetching and state gating
-# ═══════════════════════════════════════════════════════════════════════════
-from typing import List as _List, Dict as _Dict
+# Add this function to handle fetching rubrics for discussions
+# This should go in the same file where you fetch assignment rubrics
 
-def fetch_assignment_rubric(api_base: str, token: str, course_id: int, assignment_id: int) -> Optional[_List[_Dict[str, Any]]]:
-    """Return the Canvas rubric as a list of criterion dicts, or None if none is attached."""
-    url = f"{api_base}/courses/{course_id}/assignments/{assignment_id}"
+def fetch_discussion_rubric(
+    api_base: str,
+    token: str,
+    course_id: int,
+    discussion_id: int
+) -> List[Dict[str, Any]]:
+    """
+    Fetch rubric for a Canvas discussion topic.
+    Discussions use the discussion_topics endpoint but may have an associated assignment.
+    """
+    import requests
+    
+    session = requests.Session()
+    session.headers.update({"Authorization": f"Bearer {token}"})
+    
+    # First, get the discussion topic to find the assignment ID
+    topic_url = f"{api_base}/courses/{course_id}/discussion_topics/{discussion_id}"
+    topic_response = session.get(topic_url, params={"include[]": "assignment"})
+    topic_response.raise_for_status()
+    topic = topic_response.json()
+    
+    # Get the assignment object from the discussion
+    assignment = topic.get("assignment")
+    if not assignment:
+        raise ValueError(f"Discussion {discussion_id} is not graded (no associated assignment)")
+    
+    # Get the assignment ID
+    assignment_id = assignment.get("id")
+    if not assignment_id:
+        raise ValueError(f"Could not find assignment ID for discussion {discussion_id}")
+    
+    # Now fetch the rubric from the assignment
+    rubric_url = f"{api_base}/courses/{course_id}/assignments/{assignment_id}"
+    rubric_response = session.get(rubric_url, params={"include[]": "rubric"})
+    rubric_response.raise_for_status()
+    assignment_data = rubric_response.json()
+    
+    rubric = assignment_data.get("rubric") or []
+    if not rubric:
+        raise ValueError(f"No rubric found for discussion {discussion_id}")
+    
+    return rubric
+
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Helpers for rubric fetching (UPDATED TO HANDLE DISCUSSIONS)
+# ═══════════════════════════════════════════════════════════════════════════
+from typing import List as _List, Dict as _Dict, Tuple as _Tuple
+
+def fetch_assignment_or_discussion_rubric(
+    api_base: str, 
+    token: str, 
+    course_id: int, 
+    item_id: int,
+    is_discussion: bool = False
+) -> Tuple[Optional[_List[_Dict[str, Any]]], Optional[float]]:
+    """
+    Return the Canvas rubric as a list of criterion dicts and the points_possible from the assignment.
+    Handles both assignments and discussions by using the correct endpoint.
+    
+    Args:
+        api_base: Canvas API base URL
+        token: Canvas API token
+        course_id: Canvas course ID
+        item_id: Assignment ID or Discussion Topic ID
+        is_discussion: If True, use discussion_topics endpoint; otherwise use assignments endpoint
+        
+    Returns:
+        Tuple of (rubric_list, points_possible) or (None, None) if no rubric found
+    """
+    if is_discussion:
+        url = f"{api_base}/courses/{course_id}/discussion_topics/{item_id}"
+    else:
+        url = f"{api_base}/courses/{course_id}/assignments/{item_id}"
+    
     headers = {"Authorization": f"Bearer {token}"}
-    params = [("include[]", "rubric")]
+    params = [("include[]", "rubric"), ("include[]", "assignment")]
+    
+    logger.info(f"Fetching rubric from: {url}")
+    logger.info(f"Is discussion: {is_discussion}")
+    
     r = requests.get(url, headers=headers, params=params)
     r.raise_for_status()
     data: Dict[str, Any] = r.json()
-    rubric = data.get("rubric")
+    
+    # For discussions, the rubric and points_possible are nested under 'assignment' key
+    if is_discussion and 'assignment' in data:
+        assignment_data = data['assignment']
+        rubric = assignment_data.get('rubric')
+        points_possible = assignment_data.get('points_possible')
+    else:
+        rubric = data.get("rubric")
+        points_possible = data.get('points_possible')
+    
     if isinstance(rubric, list):
-        return rubric
-    return None
+        logger.info(f"Successfully loaded rubric with {len(rubric)} criteria")
+        logger.info(f"Assignment points_possible: {points_possible}")
+        return rubric, float(points_possible) if points_possible is not None else None
+    
+    logger.warning("No rubric found")
+    return None, None
 
 def _init_state():
     st.session_state.setdefault("assignment_handler", None)
     st.session_state.setdefault("rubric", None)
     st.session_state.setdefault("rubric_loaded_for", None)
     st.session_state.setdefault("rubric_total_points", 0.0)
+    st.session_state.setdefault("is_discussion", False)  # NEW: Track if it's a discussion
+    
+    # Initialize scoring defaults (12 points for assignments, will be overridden by rubric)
+    st.session_state.setdefault("threshold_score", 8.0)
+    st.session_state.setdefault("total_possible_points", 12.0)
 
     st.session_state.setdefault("entryList", [])
     st.session_state.setdefault("submissions_ready_for", None)
@@ -201,43 +295,7 @@ st.set_page_config(
 _init_state()
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Provider & Model selection
-# ═══════════════════════════════════════════════════════════════════════════
-@st.cache_resource
-def get_llm_cached(provider: str):
-    """Create and cache a provider-agnostic LLM wrapper for the selected provider."""
-    raw = get_client(provider)
-    return make_llm(provider, raw)
-
-st.markdown("## Dynamic Rubric-Based Grading System")
-st.markdown("*Enter Canvas assignment ID to automatically load rubric and grade submissions*")
-
-with st.sidebar:
-    st.header("Model Settings")
-    provider = st.selectbox("AI Provider", ["anthropic", "openai", "google"], index=0)
-    model_choices = {
-        "anthropic": {
-            "Claude 3.5 Sonnet (rec)": "claude-3-5-sonnet-20241022",
-            "Claude 3 Opus": "claude-3-opus-20240229",
-            "Claude 3 Haiku": "claude-3-haiku-20240307",
-        },
-        "openai": {
-            "GPT-4o (latest)": "chatgpt-4o-latest",
-            "GPT-4o mini": "gpt-4o-mini",
-            "GPT-4 Turbo": "gpt-4-turbo",
-        },
-        "google": {
-            "Gemini 1.5 Pro": "gemini-1.5-pro",
-            "Gemini 1.5 Flash": "gemini-1.5-flash",
-        },
-    }
-    model_name = st.selectbox("Model", list(model_choices[provider].keys()))
-    selected_model = model_choices[provider][model_name]
-
-llm = get_llm_cached(provider)
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Configuration management
+# Configuration management - Initialize before sidebar
 # ═══════════════════════════════════════════════════════════════════════════
 class DynamicRubricConfig:
     def __init__(self, config_file="config_rubric.ini"):
@@ -297,8 +355,139 @@ class DynamicRubricConfig:
                     name = key.replace('_', ' ').title()
                     history.append((name, assignment_id, course_id))
         return history
+    
+    def get_models_for_provider(self, provider: str) -> Dict[str, str]:
+        """
+        Get models for a specific provider from config.
+        Returns dict of {display_name: model_id}
+        
+        Args:
+            provider: 'anthropic', 'openai', or 'google'
+        
+        Returns:
+            Dictionary mapping display names to model IDs
+        """
+        section_name = f"{provider.upper()}_MODELS"
+        models = {}
+        
+        if section_name in self.config:
+            for key, value in self.config[section_name].items():
+                parts = [part.strip() for part in value.split(',')]
+                if len(parts) == 2:
+                    display_name, model_id = parts
+                    models[display_name] = model_id
+                else:
+                    logger.warning(f"Invalid model config for {provider}.{key}: {value}")
+        
+        return models
+    
+    def get_all_models(self) -> Dict[str, Dict[str, str]]:
+        """
+        Get all configured models for all providers.
+        Returns nested dict: {provider: {display_name: model_id}}
+        """
+        return {
+            "anthropic": self.get_models_for_provider("anthropic"),
+            "openai": self.get_models_for_provider("openai"),
+            "google": self.get_models_for_provider("google"),
+        }
 
 config = DynamicRubricConfig()
+
+# Model validation at startup
+def validate_models_at_startup():
+    """
+    Validate that configured models are accessible.
+    Logs warnings for any issues but doesn't prevent startup.
+    """
+    all_models = config.get_all_models()
+    
+    # Known valid model patterns (as of Nov 2025)
+    valid_patterns = {
+        "anthropic": ["claude-sonnet-4", "claude-3-5-sonnet", "claude-3-opus", "claude-3-haiku"],
+        "openai": ["gpt-4o", "gpt-4-turbo", "gpt-4"],
+        "google": ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-"],
+    }
+    
+    warnings = []
+    
+    for provider, models in all_models.items():
+        if not models:
+            warnings.append(f"⚠️ No {provider.title()} models configured - using defaults")
+            continue
+            
+        patterns = valid_patterns.get(provider, [])
+        for display_name, model_id in models.items():
+            # Check if model ID matches any known pattern
+            if not any(pattern in model_id for pattern in patterns):
+                warnings.append(f"⚠️ {provider.title()}: '{model_id}' may be invalid (from '{display_name}')")
+    
+    if warnings:
+        logger.warning("\n".join(["Model validation warnings:"] + warnings))
+    else:
+        logger.info("✓ All configured models appear valid")
+    
+    return warnings
+
+# Run validation at startup (only log, don't block)
+model_warnings = validate_models_at_startup()
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Provider & Model selection
+# ═══════════════════════════════════════════════════════════════════════════
+@st.cache_resource
+def get_llm_cached(provider: str):
+    """Create and cache a provider-agnostic LLM wrapper for the selected provider."""
+    raw = get_client(provider)
+    return make_llm(provider, raw)
+
+st.markdown("## Dynamic Rubric-Based Grading System")
+st.markdown("*Enter Canvas assignment ID to automatically load rubric and grade submissions*")
+
+with st.sidebar:
+    st.header("Model Settings")
+    provider = st.selectbox("AI Provider", ["anthropic", "openai", "google"], index=0)
+    
+    # Load models from config file with fallback to defaults
+    config_models = config.get_all_models()
+    
+    # Fallback defaults if config is missing or empty
+    default_models = {
+        "anthropic": {
+            "Claude Sonnet 4.5 (latest)": "claude-sonnet-4-5-20250929",
+            "Claude Sonnet 4": "claude-sonnet-4-20250514",
+            "Claude 3.5 Sonnet": "claude-3-5-sonnet-20241022",
+            "Claude 3 Opus": "claude-3-opus-20240229",
+            "Claude 3 Haiku": "claude-3-haiku-20240307",
+        },
+        "openai": {
+            "GPT-4o": "gpt-4o",
+            "GPT-4o mini": "gpt-4o-mini",
+            "GPT-4 Turbo": "gpt-4-turbo",
+        },
+        "google": {
+            "Gemini 1.5 Pro": "gemini-1.5-pro",
+            "Gemini 1.5 Flash": "gemini-1.5-flash",
+        },
+    }
+    
+    # Use config models if available, otherwise use defaults
+    model_choices = {}
+    for prov in ["anthropic", "openai", "google"]:
+        if config_models.get(prov):
+            model_choices[prov] = config_models[prov]
+            logger.info(f"Loaded {len(config_models[prov])} {prov} models from config")
+        else:
+            model_choices[prov] = default_models[prov]
+            logger.warning(f"Using default models for {prov} (not found in config)")
+    
+    model_name = st.selectbox("Model", list(model_choices[provider].keys()))
+    selected_model = model_choices[provider][model_name]
+    
+    # Display model info
+    st.caption(f"Model ID: `{selected_model}`")
+
+llm = get_llm_cached(provider)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Initialize Canvas API client
@@ -398,7 +587,12 @@ def run_grading_process(handler, entryList, model, total_points, mode="all"):
             writer = csv.writer(f)
             writer.writerows(final_entry_list)
 
-        create_xlsx(filename)
+        # Get course_id and assignment_id from session state
+        if st.session_state.submissions_ready_for:
+            course_id, assignment_id = st.session_state.submissions_ready_for
+            create_xlsx(filename, course_id=course_id, assignment_id=assignment_id)
+        else:
+            create_xlsx(filename)  # Fallback to auto-detection
 
         if results:
             avg_score = sum(r['score'] for r in results) / len(results)
@@ -450,40 +644,63 @@ selected_course_display = st.selectbox(
 selected_course_name, selected_course_id, documents_path = course_options[selected_course_display]
 st.session_state.selected_course = (selected_course_name, selected_course_id, documents_path)
 
-# Step 2: Assignment ID Entry
-st.subheader("Step 2: Enter Assignment Details")
-col1, col2 = st.columns([2, 1])
+# ═══════════════════════════════════════════════════════════════════════════
+# Step 2: Assignment ID Entry (WITH DISCUSSION CHECKBOX)
+# ═══════════════════════════════════════════════════════════════════════════
+# Add this to your rubric_grade_ui.py file
+
+# ==== STEP 2: Assignment/Discussion ID Entry ====
+st.subheader("Step 2: Enter Assignment or Discussion Details")
+
+col1, col2 = st.columns([3, 1])
+
 with col1:
     assignment_id = st.text_input(
-        "Canvas Assignment ID:",
-        help="Find this in your Canvas assignment URL: .../assignments/[ID]",
+        "Canvas ID:",
+        help="Assignment ID from .../assignments/[ID] or Discussion ID from .../discussion_topics/[ID]",
         placeholder="e.g., 123456"
     )
-    assignment_name = st.text_input(
-        "Assignment Name (for your reference):",
-        placeholder="e.g., Module 3 Essay",
-        help="Optional: This will be saved for quick access later"
-    )
-with col2:
-    st.markdown("**Recent Assignments:**")
-    history = config.get_assignment_history()
-    if history:
-        for name, hist_id, hist_course in history[-5:]:
-            if st.button(f"{name} ({hist_id})", key=f"history_{hist_id}"):
-                st.session_state.assignment_id_input = hist_id
-                st.session_state.assignment_name_input = name
-                st.rerun()
-    else:
-        st.caption("No recent assignments")
 
-# Step 3: Load Rubric
+with col2:
+    is_discussion = st.checkbox(
+        "Discussion?", 
+        value=False,
+        help="Check if this is a discussion topic instead of a regular assignment"
+    )
+
+assignment_name = st.text_input(
+    f"{'Discussion' if is_discussion else 'Assignment'} Name (for your reference):",
+    placeholder="e.g., Week 4 Discussion or Module 3 Essay",
+    help="Optional: This will be saved for quick access later"
+)
+
+# Auto-adjust scoring based on discussion checkbox
+if is_discussion:
+    if 'is_discussion' not in st.session_state or not st.session_state.get('is_discussion'):
+        st.session_state.is_discussion = True
+        st.session_state.threshold_score = 34.0
+        st.session_state.total_possible_points = 50.0
+        st.info("📊 Scoring adjusted for discussion: 50 points, threshold 34/50")
+else:
+    if st.session_state.get('is_discussion'):
+        st.session_state.is_discussion = False
+        st.session_state.threshold_score = 8.0
+        st.session_state.total_possible_points = 12.0
+        st.info("📊 Scoring adjusted for assignment: 12 points, threshold 8/12")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Step 3: Load Rubric (UPDATED TO HANDLE DISCUSSIONS)
+# ═══════════════════════════════════════════════════════════════════════════
 st.subheader("Step 3: Load Rubric")
-if assignment_id and st.button("Load Assignment Rubric", type="primary"):
-    with st.spinner("Loading rubric and course documents..."):
+
+item_type = "Discussion" if st.session_state.is_discussion else "Assignment"
+
+if assignment_id and st.button(f"Load {item_type} Rubric", type="primary"):
+    with st.spinner(f"Loading {item_type.lower()} rubric and course documents..."):
         try:
             handler = RubricAssignmentHandler(
                 assignment_key=f"dynamic_{assignment_id}",
-                display_name=assignment_name or f"Assignment {assignment_id}",
+                display_name=assignment_name or f"{item_type} {assignment_id}",
                 canvas_assignment_id=assignment_id,
                 course_id=selected_course_id,
                 course_documents_path=documents_path,
@@ -491,15 +708,66 @@ if assignment_id and st.button("Load Assignment Rubric", type="primary"):
             )
             st.session_state.assignment_handler = handler
 
-            # Fetch rubric JSON from Canvas
-            rubric_items = fetch_assignment_rubric(canvas_url, token, int(selected_course_id), int(assignment_id))
+            # Fetch rubric using the enhanced function with is_discussion flag
+            rubric_items, points_possible = fetch_assignment_or_discussion_rubric(
+                api_base=canvas_url,
+                token=token,
+                course_id=int(selected_course_id),
+                item_id=int(assignment_id),
+                is_discussion=st.session_state.is_discussion
+            )
+            
             if rubric_items is not None:
                 st.session_state.rubric = rubric_items
-                st.session_state.rubric_total_points = float(sum((c.get("points") or 0) for c in rubric_items))
+                
+                # Use points_possible from Canvas if available, otherwise sum rubric criteria
+                if points_possible is not None:
+                    rubric_points = points_possible
+                    st.info(f"Using Canvas assignment points: {rubric_points}")
+                else:
+                    rubric_points = float(sum((c.get("points") or 0) for c in rubric_items))
+                    st.warning(f"Could not get points_possible from Canvas, calculated from rubric: {rubric_points}")
+                
+                st.session_state.rubric_total_points = rubric_points
+                
+                # CRITICAL: Override handler's rubric data with the correctly fetched rubric
+                # The handler may have failed to load the rubric (e.g., for discussions),
+                # so we need to manually set its rubric_criteria, rubric_data, and total_points
+                handler.rubric_criteria = rubric_items
+                handler.total_points = rubric_points
+                
+                # Also update rubric_data dict for any code that references it
+                handler.rubric_data = {
+                    "rubric_criteria": rubric_items,
+                    "total_points": rubric_points
+                }
+                
+                # Scale the rubric criteria if needed
+                rubric_sum = sum(float(c.get("points", 0)) for c in rubric_items)
+                if rubric_sum > 0 and abs(rubric_sum - rubric_points) > 0.01:
+                    scale_factor = rubric_points / rubric_sum
+                    st.info(f"Scaling rubric criteria: {rubric_sum} points → {rubric_points} points (factor: {scale_factor:.3f})")
+                    
+                    for criterion in handler.rubric_criteria:
+                        original_points = float(criterion.get("points", 0))
+                        criterion["points"] = original_points * scale_factor
+                        
+                        for rating in criterion.get("ratings", []):
+                            original_rating_points = float(rating.get("points", 0))
+                            rating["points"] = original_rating_points * scale_factor
+                
+                st.info(f"✓ Handler configured with {len(handler.rubric_criteria)} criteria, {handler.total_points} points")
+                
+                # Override total_possible_points with actual rubric points
+                st.session_state.total_possible_points = rubric_points
+                # Set threshold to 2/3 of total for assignments, keep custom for discussions
+                if not st.session_state.is_discussion:
+                    st.session_state.threshold_score = rubric_points * 0.67
+                
                 st.session_state.rubric_loaded_for = (int(selected_course_id), int(assignment_id))
-                st.success("Rubric loaded.")
+                st.success(f"{item_type} rubric loaded successfully! ({len(rubric_items)} criteria, {rubric_points} points)")
             else:
-                st.warning("No rubric attached to this assignment in Canvas.")
+                st.warning(f"No rubric attached to this {item_type.lower()} in Canvas.")
                 st.session_state.rubric = None
                 st.session_state.rubric_total_points = 0.0
                 st.session_state.rubric_loaded_for = None
@@ -509,8 +777,93 @@ if assignment_id and st.button("Load Assignment Rubric", type="primary"):
 
             _recompute_ready_flag()
         except Exception as e:
-            st.error(f"Error loading assignment: {e}")
-            logger.error(f"Assignment loading error: {e}")
+            st.error(f"Error loading {item_type.lower()}: {e}")
+            logger.error(f"{item_type} loading error: {e}", exc_info=True)
+
+# ==== STEP 4: Load Submissions ====
+st.subheader("Step 4: Load Submissions")
+
+if assignment_id and st.button("Download submissions from Canvas"):
+    item_type = "discussion" if is_discussion else "assignment"
+    
+    with st.spinner(f"Clearing submissions folder and downloading {item_type}..."):
+        course_id = int(selected_course_id)
+        item_id = int(assignment_id)
+        
+        try:
+            # Use different download function based on type
+            if is_discussion:
+                from canvas_submissions import download_discussion_submissions
+                students, files, metadata = download_discussion_submissions(
+                    canvas_base_url=canvas_url,
+                    token=token,
+                    course_id=course_id,
+                    discussion_id=item_id,
+                    dest_dir="./submissions",
+                    clean_dest=True
+                )
+            else:
+                from canvas_submissions import download_submissions_flat
+                students, files, metadata = download_submissions_flat(
+                    canvas_base_url=canvas_url,
+                    token=token,
+                    course_id=course_id,
+                    assignment_id=item_id,
+                    dest_dir="./submissions",
+                    clean_dest=True
+                )
+            
+            st.session_state.submission_metadata = metadata
+            st.success(f"✓ Cleared old files and pulled {files} new files for {students} students")
+            st.info("✓ Captured existing grades and feedback for preservation")
+            import glob
+            # Look for both .txt and .html files (assignments and discussions)
+            txt_files = glob.glob("./submissions/*.txt")
+            html_files = glob.glob("./submissions/*.html")
+            submission_files = txt_files + html_files
+            entryList = []
+            student_metadata = {}
+            for file in submission_files:
+                basename = os.path.basename(file)
+                label = os.path.splitext(basename)[0]
+                with open(file, encoding='utf-8', errors='ignore') as f:
+                    submission_text = f.read().strip()
+                user_id = extract_user_id_from_label(label)
+                if user_id and str(user_id) in metadata:
+                    meta = metadata[str(user_id)]
+                    current_grade = meta.get('current_grade') or meta.get('current_score', '')
+                    current_feedback = meta.get('current_feedback', '')
+                    name = meta.get('name', label)
+                    submission_date = meta.get('submission_date', '')
+                    student_metadata[str(user_id)] = {
+                        'name': name,
+                        'current_grade': current_grade,
+                        'current_feedback': current_feedback,
+                        'submission_date': submission_date
+                    }
+                    if current_feedback:
+                        feedback_entry = current_feedback
+                    else:
+                        feedback_entry = f"{current_grade}/{st.session_state.rubric_total_points if st.session_state.rubric else '?'}" if current_grade else ""
+                else:
+                    feedback_entry = ""
+                entryList.append([label, submission_text, feedback_entry])
+            st.session_state.entryList = entryList
+            st.session_state.student_metadata = student_metadata
+            st.session_state.submissions_ready_for = (int(selected_course_id), int(assignment_id))
+            # Store original entries for selective grading
+            st.session_state.original_entries = {}
+            for entry in entryList:
+                user_id = extract_user_id_from_label(entry[0])
+                if user_id:
+                    st.session_state.original_entries[str(user_id)] = entry.copy()
+            _recompute_ready_flag()
+            if entryList:
+                st.success(f"✓ Loaded {len(entryList)} submissions")
+            
+        except Exception as e:
+            st.error(f"Error downloading {item_type}: {str(e)}")
+            st.error("Please check the ID and try again")
 
 # Step 3.5: Assignment Overview
 if st.session_state.rubric is not None and st.session_state.assignment_handler:
@@ -525,7 +878,8 @@ if st.session_state.rubric is not None and st.session_state.assignment_handler:
     if isinstance(df_obj, pd.DataFrame):
         document_chunks = len(df_obj)
 
-    st.subheader("Assignment Overview")
+    item_type_display = "Discussion" if st.session_state.is_discussion else "Assignment"
+    st.subheader(f"{item_type_display} Overview")
     col1, col2, col3 = st.columns(3)
     with col1: st.metric("Total Points", total_points)
     with col2: st.metric("Rubric Criteria", criterion_count)
@@ -540,83 +894,41 @@ if st.session_state.rubric is not None and st.session_state.assignment_handler:
             if isinstance(ld, str) and ld.strip():
                 st.caption(ld)
 
-# Step 4: Load Submissions
-st.subheader("Step 4: Load Submissions")
-if assignment_id and st.button("Download submissions from Canvas"):
-    with st.spinner("Clearing submissions folder and downloading..."):
-        course_id = int(selected_course_id)
-        asg_id = int(assignment_id)
-        students, files, metadata = download_submissions_flat(
-            canvas_base_url=canvas_url,
-            token=token,
-            course_id=course_id,
-            assignment_id=asg_id,
-            dest_dir="./submissions",
-            clean_dest=True
-        )
-        st.session_state.entryList = grade_all.makeEntryList(selected_course_id)
-        st.session_state.submissions_ready_for = (course_id, asg_id)
-        st.session_state.student_metadata = metadata
-        
-        # Store original entries with existing grades/feedback
-        st.session_state.original_entries = {}
-        for entry in st.session_state.entryList:
-            student_label = entry[0]
-            user_id = extract_user_id_from_label(student_label)
-            if user_id and str(user_id) in metadata:
-                meta = metadata[str(user_id)]
-                existing_feedback = ""
-                
-                if meta.get('current_score') is not None:
-                    score = meta['current_score']
-                    max_pts = st.session_state.get('rubric_total_points', 12.0)
-                    feedback_text = meta.get('current_feedback', '')
-                    if feedback_text:
-                        existing_feedback = f"{score}/{max_pts} - {feedback_text}"
-                    else:
-                        existing_feedback = f"{score}/{max_pts} - Previously graded"
-                elif meta.get('current_grade'):
-                    existing_feedback = f"{meta['current_grade']} - Previously graded"
-                
-                original_entry = entry.copy()
-                if existing_feedback:
-                    original_entry[2] = existing_feedback
-                st.session_state.original_entries[str(user_id)] = original_entry
-            else:
-                st.session_state.original_entries[str(user_id)] = entry.copy()
-        
-        st.success(f"✓ Cleared old files and pulled {files} new files for {students} students")
-        st.info("✓ Captured existing grades and feedback for preservation")
-        _recompute_ready_flag()
-        st.rerun()
 
-# Optional manual refresh
-if st.button("Refresh Submissions"):
-    st.session_state.entryList = grade_all.makeEntryList(selected_course_id)
-    if assignment_id:
-        st.session_state.submissions_ready_for = (int(selected_course_id), int(assignment_id))
-    _recompute_ready_flag()
-    st.success(f"Refreshed: {len(st.session_state.entryList)} submissions loaded")
+# Debug: Show status if not ready to grade
+if not st.session_state.ready_to_grade:
+    with st.expander("🔍 Debug: Why can't I grade yet?"):
+        st.write("**Status Check:**")
+        st.write(f"- Rubric loaded: {st.session_state.rubric is not None}")
+        st.write(f"- Submissions loaded: {st.session_state.submissions_ready_for is not None}")
+        st.write(f"- Rubric loaded for: {st.session_state.rubric_loaded_for}")
+        st.write(f"- Submissions loaded for: {st.session_state.submissions_ready_for}")
+        st.write(f"- IDs match: {st.session_state.rubric_loaded_for == st.session_state.submissions_ready_for}")
+        st.write(f"- Entry count: {len(st.session_state.entryList)} submissions")
+        st.write(f"- Ready to grade: {st.session_state.ready_to_grade}")
+        
+        if st.session_state.rubric_loaded_for != st.session_state.submissions_ready_for:
+            st.warning("⚠️ The rubric and submissions are for different assignments. Make sure to load both for the same assignment ID.")
+        if not st.session_state.entryList:
+            st.warning("⚠️ No submission files found. Check that files were downloaded to ./submissions/")
 
-# Step 4.5: Select Grading Mode
-if st.session_state.ready_to_grade and st.session_state.entryList:
-    st.subheader("Step 4.5: Choose Grading Mode")
+# Step 4.5: Grading Mode Selection
+if st.session_state.ready_to_grade:
+    st.subheader("Step 4.5: Select Grading Mode")
     
     grading_mode = st.radio(
-        "Select grading approach:",
-        ["Grade all submissions", "Select specific submissions to grade"],
+        "How would you like to grade?",
+        ["Grade all submissions", "Select specific students to grade"],
         index=0 if st.session_state.grading_mode == "all" else 1,
-        horizontal=True
+        help="Choose whether to grade all submissions or select specific students"
     )
     
-    if grading_mode == "Grade all submissions":
-        st.session_state.grading_mode = "all"
-        st.session_state.selected_students = set()
-        st.info(f"✓ All {len(st.session_state.entryList)} submissions will be graded")
+    st.session_state.grading_mode = "all" if grading_mode == "Grade all submissions" else "selective"
     
-    else:  # Select specific submissions
-        st.session_state.grading_mode = "selective"
-        st.markdown("**Select students to grade:**")
+    # Show student selection UI if selective mode
+    if st.session_state.grading_mode == "selective":
+        st.markdown("---")
+        st.markdown("### Select Students to Grade")
         st.info("💡 **Tip:** Unselected students will keep their existing grades and feedback. Only selected students will be re-graded.")
         
         # Build selection data
@@ -740,12 +1052,41 @@ source = st.radio(
 
 if source == "Current session (graded list)":
     if st.button("Upload current session grades", type="primary"):
+        # For discussions, we need to get the underlying assignment ID
+        upload_assignment_id = assignment_id
+        
+        if st.session_state.is_discussion:
+            with st.spinner("Getting discussion assignment ID..."):
+                try:
+                    # Fetch discussion to get the underlying assignment_id
+                    discussion_url = f"{canvas_url}/courses/{selected_course_id}/discussion_topics/{assignment_id}"
+                    headers = {"Authorization": f"Bearer {token}"}
+                    response = requests.get(discussion_url, headers=headers, params={"include[]": "assignment"})
+                    response.raise_for_status()
+                    discussion_data = response.json()
+                    
+                    # Get the assignment object
+                    assignment = discussion_data.get("assignment")
+                    if not assignment:
+                        st.error("This discussion is not graded (no associated assignment)")
+                        st.stop()
+                    
+                    upload_assignment_id = assignment.get("id")
+                    if not upload_assignment_id:
+                        st.error("Could not find assignment ID for this discussion")
+                        st.stop()
+                    
+                    st.info(f"Discussion ID {assignment_id} → Assignment ID {upload_assignment_id}")
+                except Exception as e:
+                    st.error(f"Error fetching discussion assignment ID: {e}")
+                    st.stop()
+        
         with st.spinner("Uploading grades..."):
             ok, fail, failures = upload_all_from_entrylist(
                 api_base=canvas_url,
                 token=token,
                 course_id=int(selected_course_id),
-                assignment_id=int(assignment_id),
+                assignment_id=int(upload_assignment_id),
                 entry_list=st.session_state.entryList,
             )
         st.success(f"Uploaded {ok} grades")
@@ -759,6 +1100,36 @@ else:
     respect_flag = st.checkbox("Respect 'Upload?' column", value=True)
     if up and st.button("Upload grades from XLSX", type="primary"):
         import tempfile, shutil, os
+        
+        # For discussions, we need to get the underlying assignment ID
+        upload_assignment_id = assignment_id
+        
+        if st.session_state.is_discussion:
+            with st.spinner("Getting discussion assignment ID..."):
+                try:
+                    # Fetch discussion to get the underlying assignment_id
+                    discussion_url = f"{canvas_url}/courses/{selected_course_id}/discussion_topics/{assignment_id}"
+                    headers = {"Authorization": f"Bearer {token}"}
+                    response = requests.get(discussion_url, headers=headers, params={"include[]": "assignment"})
+                    response.raise_for_status()
+                    discussion_data = response.json()
+                    
+                    # Get the assignment object
+                    assignment = discussion_data.get("assignment")
+                    if not assignment:
+                        st.error("This discussion is not graded (no associated assignment)")
+                        st.stop()
+                    
+                    upload_assignment_id = assignment.get("id")
+                    if not upload_assignment_id:
+                        st.error("Could not find assignment ID for this discussion")
+                        st.stop()
+                    
+                    st.info(f"Discussion ID {assignment_id} → Assignment ID {upload_assignment_id}")
+                except Exception as e:
+                    st.error(f"Error fetching discussion assignment ID: {e}")
+                    st.stop()
+        
         with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
             tmp.write(up.read())
             tmp_path = tmp.name
@@ -767,7 +1138,7 @@ else:
                 api_base=canvas_url,
                 token=token,
                 course_id=int(selected_course_id),
-                assignment_id=int(assignment_id),
+                assignment_id=int(upload_assignment_id),
                 xlsx_path=tmp_path,
                 respect_upload_flag=respect_flag
             )
@@ -789,7 +1160,9 @@ with st.sidebar:
 
     if st.session_state.assignment_handler:
         handler = st.session_state.assignment_handler
-        st.write(f"**Assignment:** {handler.display_name}")
+        item_type = "Discussion" if st.session_state.is_discussion else "Assignment"
+        st.write(f"**Type:** {item_type}")
+        st.write(f"**Name:** {handler.display_name}")
         st.write(f"**Canvas ID:** {handler.canvas_assignment_id}")
         st.write(f"**Total Points:** {st.session_state.rubric_total_points or handler.total_points}")
 
@@ -797,19 +1170,32 @@ with st.sidebar:
         st.write(f"**Submissions:** {len(st.session_state.entryList)} loaded")
 
     st.markdown("---")
-    st.header("How to Find Canvas Assignment ID")
+    st.header("How to Find Canvas ID")
     st.markdown("""
+    **For Assignments:**
     1. Go to your Canvas course  
     2. Click on "Assignments"  
     3. Click on the specific assignment  
-    4. Look at the URL in your browser  
-    5. The assignment ID is the number at the end  
-
-    Example URL: `https://school.instructure.com/courses/12345/assignments/67890`  
-    Assignment ID = **67890**
+    4. Look at the URL: `.../assignments/[ID]`
+    
+    **For Discussions:**
+    1. Go to your Canvas course
+    2. Click on "Discussions"
+    3. Click on the discussion
+    4. Look at the URL: `.../discussion_topics/[ID]`
+    
+    The ID is the number at the end of the URL.
     """)
 
     st.markdown("---")
     st.header("System Status")
     st.success("Canvas API: Connected")
     st.success(f"LLM: {provider.title()} ready")
+    
+    # Show model validation warnings if any
+    if model_warnings:
+        with st.expander(f"⚠️ {len(model_warnings)} Model Warning(s)", expanded=False):
+            for warning in model_warnings:
+                st.warning(warning)
+    else:
+        st.success("✓ All models validated")
