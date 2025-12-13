@@ -38,8 +38,7 @@ class CanvasRubricAPI:
         Returns:
             Dictionary containing assignment and rubric data
         """
-#        url = f"{self.canvas_url}/api/v1/courses/{course_id}/assignments/{assignment_id}"
-        url = f"{self.canvas_url}/courses/{course_id}/assignments/{assignment_id}"
+        url = f"{self.canvas_url}/api/v1/courses/{course_id}/assignments/{assignment_id}"
         params = {
             'include[]': ['rubric']
         }
@@ -55,6 +54,58 @@ class CanvasRubricAPI:
         except requests.exceptions.RequestException as e:
             logger.error(f"Error fetching assignment {assignment_id}: {e}")
             return {}
+    
+    def get_discussion_assignment_id(self, course_id: str, discussion_topic_id: str) -> Optional[str]:
+        """
+        Find the assignment ID associated with a discussion topic
+        
+        Args:
+            course_id: Canvas course ID
+            discussion_topic_id: Canvas discussion topic ID
+            
+        Returns:
+            Associated assignment ID, or None if not found
+        """
+        url = f"{self.canvas_url}/api/v1/courses/{course_id}/discussion_topics/{discussion_topic_id}"
+        
+        try:
+            response = requests.get(url, headers=self.headers)
+            response.raise_for_status()
+            
+            discussion_data = response.json()
+            assignment_id = discussion_data.get('assignment_id')
+            
+            if assignment_id:
+                logger.info(f"Found assignment ID {assignment_id} for discussion topic {discussion_topic_id}")
+            else:
+                logger.warning(f"No assignment ID found for discussion topic {discussion_topic_id}")
+            
+            return str(assignment_id) if assignment_id else None
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching discussion topic {discussion_topic_id}: {e}")
+            return None
+    
+    def get_discussion_with_rubric(self, course_id: str, discussion_topic_id: str) -> Dict:
+        """
+        Get discussion data including rubric information
+        
+        Args:
+            course_id: Canvas course ID
+            discussion_topic_id: Canvas discussion topic ID
+            
+        Returns:
+            Dictionary containing assignment and rubric data
+        """
+        # First, find the associated assignment ID
+        assignment_id = self.get_discussion_assignment_id(course_id, discussion_topic_id)
+        
+        if not assignment_id:
+            logger.error(f"Could not find assignment ID for discussion topic {discussion_topic_id}")
+            return {}
+        
+        # Now get the assignment with its rubric
+        return self.get_assignment_with_rubric(course_id, assignment_id)
     
     def get_course_assignments(self, course_id: str) -> List[Dict]:
         """
@@ -223,13 +274,14 @@ def load_canvas_credentials(secrets_file: str = '/home/drkeithcox/canvas-secrets
         raise
 
 # Convenience function for quick rubric retrieval
-def get_rubric_for_assignment(course_id: str, assignment_id: str) -> Dict:
+def get_rubric_for_assignment(course_id: str, assignment_id: str, is_discussion: bool = False) -> Dict:
     """
-    Quick function to get rubric data for a specific assignment
+    Quick function to get rubric data for a specific assignment or discussion
     
     Args:
         course_id: Canvas course ID
-        assignment_id: Canvas assignment ID
+        assignment_id: Canvas assignment ID or discussion topic ID
+        is_discussion: True if this is a discussion topic ID
         
     Returns:
         Dictionary with assignment and parsed rubric data
@@ -238,7 +290,11 @@ def get_rubric_for_assignment(course_id: str, assignment_id: str) -> Dict:
         canvas_url, api_token = load_canvas_credentials()
         canvas_api = CanvasRubricAPI(canvas_url, api_token)
         
-        assignment_data = canvas_api.get_assignment_with_rubric(course_id, assignment_id)
+        # Get assignment data - different method for discussions
+        if is_discussion:
+            assignment_data = canvas_api.get_discussion_with_rubric(course_id, assignment_id)
+        else:
+            assignment_data = canvas_api.get_assignment_with_rubric(course_id, assignment_id)
         
         if not assignment_data:
             return {}

@@ -64,7 +64,7 @@ class OpenAILLM(LLMBase):
                 model=model,
                 messages=messages,
                 temperature=temperature,
-                max_tokens=max_tokens,
+                max_completion_tokens=max_tokens,
             )
             return resp.choices[0].message.content
 
@@ -78,7 +78,7 @@ class OpenAILLM(LLMBase):
                         model=fam,
                         messages=messages,
                         temperature=temperature,
-                        max_tokens=max_tokens,
+                        max_completion_tokens=max_tokens,
                     )
                     return resp.choices[0].message.content
             raise
@@ -107,24 +107,74 @@ class GoogleLLM(LLMBase):
 
     def _extract_text(self, resp: Any) -> str:
         # Be liberal in what we accept; google-genai responses expose text in a few ways
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # Method 1: Direct .text attribute
         if hasattr(resp, "text") and resp.text:
+            logger.debug("Extracted text using resp.text")
             return resp.text
+        
+        # Method 2: output_text attribute
         if hasattr(resp, "output_text") and resp.output_text:
+            logger.debug("Extracted text using resp.output_text")
             return resp.output_text
-        # Fall back to candidates parts
+        
+        # Method 3: candidates[0].content.parts[0].text
         try:
-            candidates = getattr(resp, "candidates", None) or []
-            if candidates:
-                parts = getattr(candidates[0].content, "parts", []) or []
-                for p in parts:
-                    t = getattr(p, "text", None)
-                    if t:
-                        return t
-        except Exception:
-            pass
+            candidates = getattr(resp, "candidates", None)
+            if candidates and len(candidates) > 0:
+                candidate = candidates[0]
+                content = getattr(candidate, "content", None)
+                if content:
+                    parts = getattr(content, "parts", None)
+                    if parts and len(parts) > 0:
+                        # Collect all text from all parts
+                        texts = []
+                        for part in parts:
+                            if hasattr(part, "text"):
+                                texts.append(part.text)
+                        if texts:
+                            result = "".join(texts)
+                            logger.debug(f"Extracted {len(result)} chars from content.parts")
+                            return result
+                    else:
+                        logger.warning(f"Content has no parts or empty parts. Content: {content}")
+        except Exception as e:
+            logger.warning(f"Method 3 (candidates extraction) failed: {e}")
+        
+        # Method 4: Try accessing via dict-like interface
+        try:
+            if hasattr(resp, "candidates") and resp.candidates:
+                candidate = resp.candidates[0]
+                if hasattr(candidate, "content") and candidate.content:
+                    if hasattr(candidate.content, "parts") and candidate.content.parts:
+                        texts = []
+                        for part in candidate.content.parts:
+                            if hasattr(part, "text") and part.text:
+                                texts.append(part.text)
+                        if texts:
+                            result = "".join(texts)
+                            logger.debug(f"Extracted {len(result)} chars using dict-like access")
+                            return result
+        except Exception as e:
+            logger.debug(f"Method 4 failed: {e}")
+        
+        # Log what we got for debugging
+        logger.error(f"Could not extract text from Google response. Response type: {type(resp)}")
+        if hasattr(resp, "candidates") and resp.candidates:
+            cand = resp.candidates[0]
+            logger.error(f"Candidate finish_reason: {getattr(cand, 'finish_reason', 'unknown')}")
+            if hasattr(cand, "content"):
+                logger.error(f"Content type: {type(cand.content)}")
+                logger.error(f"Content dir: {[a for a in dir(cand.content) if not a.startswith('_')]}")
+        
         return ""
 
     def generate(self, model, messages, temperature=0.2, max_tokens=1024) -> str:
+        import logging
+        logger = logging.getLogger(__name__)
+        
         req = self._to_gemini(messages)
         contents = req["contents"]
 
@@ -138,14 +188,19 @@ class GoogleLLM(LLMBase):
                     "max_output_tokens": int(max_tokens),
                 },
             )
-        except TypeError:
+            logger.debug(f"Google API response received, type: {type(resp)}")
+        except TypeError as e:
+            logger.warning(f"Config parameter failed, trying without config: {e}")
             # Fallback: call without config if the installed version is stricter
             resp = self.client.models.generate_content(
                 model=model,
                 contents=contents,
             )
 
-        return self._extract_text(resp)
+        text = self._extract_text(resp)
+        if not text:
+            logger.error("Failed to extract text from Google response")
+        return text
 
 # ── Factory ───────────────────────────────────────────────────────────────────
 def make_llm(provider: str, raw_client) -> LLMBase:

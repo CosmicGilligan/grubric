@@ -35,6 +35,7 @@ class RubricAssignmentHandler:
         # NEW: prefer llm, keep claude_client for backward compatibility
         llm: Optional[LLMBase] = None,
         claude_client: Optional[Any] = None,  # legacy raw Anthropic client
+        leniency_multiplier: float = 1.0,  # NEW: configurable grading leniency
     ) -> None:
         """
         Initialize rubric-based assignment handler
@@ -47,12 +48,14 @@ class RubricAssignmentHandler:
             course_documents_path: Path to course documents (e.g., "../db/text/HIST109")
             llm: Unified LLM wrapper (recommended). See llm_provider.LLMBase
             claude_client: (deprecated) Raw Anthropic client; wrapped if llm not supplied
+            leniency_multiplier: Multiplier for scores (1.0=no change, 1.2=20% boost, 0.9=10% stricter)
         """
         self.assignment_key = assignment_key
         self.display_name = display_name
         self.canvas_assignment_id = canvas_assignment_id
         self.course_id = course_id
         self.course_documents_path = course_documents_path
+        self.leniency_multiplier = leniency_multiplier
 
         # Provider-agnostic LLM setup
         if llm is not None:
@@ -217,14 +220,19 @@ class RubricAssignmentHandler:
         except Exception:
             document_context = "No course documents available for context."
 
-        prompt = f"""You are grading a student assignment using a specific rubric and course materials as context.
+        prompt = f"""You are grading {student_name}'s assignment using a specific rubric and course materials as context.
 
     STYLE:
-    - Write in neutral, document-centric third person.
-    - Do NOT refer to 'the student' and do NOT use 'you'.
-    - Refer to the work as 'the submission' or 'this submission'.
+    - Write in a friendly, encouraging tone
+    - Address {student_name} directly using "you" and "your"
+    - Be supportive and recognize effort
+    - Keep feedback brief and to the point
 
-    STUDENT: {student_name}
+    GRADING APPROACH:
+    - Be generous in your interpretation of the rubric
+    - Give credit for partial understanding and effort
+    - Focus on what the student did well
+    - When work shows understanding of concepts, award full or near-full points
 
     {self.get_rubric_prompt()}
 
@@ -232,26 +240,23 @@ class RubricAssignmentHandler:
 
     {additional_context if additional_context else ""}
 
-    STUDENT SUBMISSION:
+    {student_name}'s SUBMISSION:
     {submission_text}
 
     GRADING INSTRUCTIONS:
     IMPORTANT: This assignment is worth {self.total_points} TOTAL POINTS. Calculate the total score out of {self.total_points}.
     
-    1. Evaluate the submission against each rubric criterion
-    2. Use the course materials as context to assess accuracy and depth
-    3. For each criterion, provide:
-    - Points earned out of possible points
-    - Specific justification based on rubric standards
-    - Reference to course materials when relevant
-    4. Provide constructive feedback for improvement
+    1. Evaluate the submission generously against each rubric criterion
+    2. Award full points when work demonstrates understanding, even if not perfectly expressed
+    3. For each criterion, provide BRIEF justification (1-2 sentences max)
+    4. Keep overall feedback concise (2-3 sentences)
 
     Format your response as:
-    CRITERION 1: [earned_points]/[max_points] - [detailed justification]
-    CRITERION 2: [earned_points]/[max_points] - [detailed justification]
+    CRITERION 1: [earned_points]/[max_points] - [brief justification]
+    CRITERION 2: [earned_points]/[max_points] - [brief justification]
     ...
     TOTAL SCORE: [total_earned]/{self.total_points}
-    OVERALL FEEDBACK: [comprehensive feedback and suggestions for improvement]
+    OVERALL FEEDBACK: [brief, encouraging feedback addressing {student_name} directly]
     """
         return prompt
 
@@ -259,10 +264,9 @@ class RubricAssignmentHandler:
     def build_system_prompt(self) -> str:
         """Short system directive to keep the LLM on task and format."""
         return (
-            "You are a meticulous grader. Follow the rubric strictly. "
-            "Write in neutral, document-centric third person. "
-            "Do NOT address the student directly and do NOT use second-person pronouns. "
-            "Avoid phrases like 'the student' or 'you'; instead refer to 'the submission' or 'this submission'. "
+            "You are a supportive, generous grader. Interpret rubrics generously and give students the benefit of the doubt. "
+            "Write in a friendly, encouraging tone addressing the student directly. "
+            "Keep feedback brief and focused on positives. "
             "Use the exact output format requested."
         )
 
@@ -288,7 +292,7 @@ class RubricAssignmentHandler:
                 model=model,
                 messages=messages,
                 temperature=0.2,
-                max_tokens=1200,
+                max_tokens=2048,
             )
 
             # DEBUG: Print raw response
@@ -369,6 +373,25 @@ class RubricAssignmentHandler:
                     }
                 )
 
+            # Apply leniency boost to all scores (cap at maximum)
+            # Multiplier is configurable via constructor (default 1.0 = no adjustment)
+            
+            # Boost total score (cap at max)
+            if result["score"] > 0 and self.leniency_multiplier != 1.0:
+                original_score = result["score"]
+                boosted_score = result["score"] * self.leniency_multiplier
+                result["score"] = min(boosted_score, result["max_score"])
+                boost_pct = (self.leniency_multiplier - 1.0) * 100
+                logger.info(f"Applied {boost_pct:+.0f}% leniency to {student_name}: {original_score:.1f} → {result['score']:.1f}/{result['max_score']}")
+            
+            # Boost individual criterion scores (cap at each criterion's max)
+            if self.leniency_multiplier != 1.0:
+                for cs in result["criterion_scores"]:
+                    if cs["earned"] > 0:
+                        boosted = cs["earned"] * self.leniency_multiplier
+                        cs["earned"] = min(boosted, cs["possible"])
+
+
             # Extract overall feedback
             overall_feedback_match = re.search(
                 r"OVERALL FEEDBACK:\s*(.+)$", response_text, re.IGNORECASE | re.DOTALL
@@ -383,31 +406,28 @@ class RubricAssignmentHandler:
                 overall_feedback = overall_feedback_match.group(1).strip()
                 # Clean up the feedback - remove ALL score tokens (including ones already in the text)
                 cleaned_feedback = re.sub(r"\b\d+(?:\.\d+)?/\d+(?:\.\d+)?\b\s*-?\s*", "", overall_feedback)
-                cleaned_feedback = self._normalize_references(cleaned_feedback)
+                # Keep personalized language - don't normalize references
                 
                 # Only format if we haven't already formatted (avoid duplication)
                 if not cleaned_feedback.startswith(f"{result['score']}/{result['max_score']}"):
                     # Format feedback WITH criterion breakdown (no letter grade)
-                    breakdown_str = ", ".join([str(cs["earned"]) for cs in result["criterion_scores"]])
+                    breakdown_str = ", ".join([f"{cs['earned']:.1f}" for cs in result["criterion_scores"]])
                     if breakdown_str:
-                        result["feedback"] = f"{result['score']}/{result['max_score']} ({breakdown_str}) - {cleaned_feedback}"
+                        result["feedback"] = f"{result['score']:.1f}/{result['max_score']} ({breakdown_str}) - {cleaned_feedback}"
                     else:
-                        result["feedback"] = f"{result['score']}/{result['max_score']} - {cleaned_feedback}"
+                        result["feedback"] = f"{result['score']:.1f}/{result['max_score']} - {cleaned_feedback}"
                 else:
                     # Already formatted, just use cleaned version
                     result["feedback"] = cleaned_feedback
             else:
                 # No overall feedback found, just use score and breakdown
-                breakdown_str = ", ".join([str(cs["earned"]) for cs in result["criterion_scores"]])
+                breakdown_str = ", ".join([f"{cs['earned']:.1f}" for cs in result["criterion_scores"]])
                 if breakdown_str:
-                    result["feedback"] = f"{result['score']}/{result['max_score']} ({breakdown_str}) - No detailed feedback provided"
+                    result["feedback"] = f"{result['score']:.1f}/{result['max_score']} ({breakdown_str}) - No detailed feedback provided"
                 else:
-                    result["feedback"] = f"{result['score']}/{result['max_score']} - No detailed feedback provided"
+                    result["feedback"] = f"{result['score']:.1f}/{result['max_score']} - No detailed feedback provided"
 
-            # Clean each criterion justification
-            for cs in result["criterion_scores"]:
-                if isinstance(cs.get("justification"), str):
-                    cs["justification"] = self._normalize_references(cs["justification"])
+            # Keep personalized language in criterion justifications - don't normalize
 
             return result
 

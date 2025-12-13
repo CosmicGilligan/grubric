@@ -211,44 +211,53 @@ def fetch_assignment_or_discussion_rubric(
     """
     Return the Canvas rubric as a list of criterion dicts and the points_possible from the assignment.
     Handles both assignments and discussions by using the correct endpoint.
-    
-    Args:
-        api_base: Canvas API base URL
-        token: Canvas API token
-        course_id: Canvas course ID
-        item_id: Assignment ID or Discussion Topic ID
-        is_discussion: If True, use discussion_topics endpoint; otherwise use assignments endpoint
-        
-    Returns:
-        Tuple of (rubric_list, points_possible) or (None, None) if no rubric found
     """
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    # For discussions, we need to first find the associated assignment ID
     if is_discussion:
-        url = f"{api_base}/courses/{course_id}/discussion_topics/{item_id}"
+        logger.info(f"Fetching discussion topic {item_id} to find associated assignment")
+        discussion_url = f"{api_base}/courses/{course_id}/discussion_topics/{item_id}"
+        
+        r = requests.get(discussion_url, headers=headers)
+        r.raise_for_status()
+        discussion_data = r.json()
+        
+        # Get the assignment ID from the discussion
+        assignment_id = discussion_data.get('assignment_id')
+        
+        if not assignment_id:
+            logger.error(f"Discussion topic {item_id} has no associated assignment (not graded)")
+            return None, None
+        
+        logger.info(f"Found assignment ID {assignment_id} for discussion topic {item_id}")
+        
+        # Now fetch the assignment with its rubric
+        url = f"{api_base}/courses/{course_id}/assignments/{assignment_id}"
     else:
+        # Regular assignment
         url = f"{api_base}/courses/{course_id}/assignments/{item_id}"
     
-    headers = {"Authorization": f"Bearer {token}"}
-    params = [("include[]", "rubric"), ("include[]", "assignment")]
+    # Fetch the assignment with rubric
+    params = [("include[]", "rubric")]
     
     logger.info(f"Fetching rubric from: {url}")
-    logger.info(f"Is discussion: {is_discussion}")
     
     r = requests.get(url, headers=headers, params=params)
     r.raise_for_status()
     data: Dict[str, Any] = r.json()
     
-    # For discussions, the rubric and points_possible are nested under 'assignment' key
-    if is_discussion and 'assignment' in data:
-        assignment_data = data['assignment']
-        rubric = assignment_data.get('rubric')
-        points_possible = assignment_data.get('points_possible')
-    else:
-        rubric = data.get("rubric")
-        points_possible = data.get('points_possible')
+    rubric = data.get("rubric")
+    points_possible = data.get('points_possible')
     
-    if isinstance(rubric, list):
-        logger.info(f"Successfully loaded rubric with {len(rubric)} criteria")
-        logger.info(f"Assignment points_possible: {points_possible}")
+    if isinstance(rubric, list) and len(rubric) > 0:
+        # If points_possible is 0 or None, calculate from rubric criteria
+        if not points_possible or points_possible == 0:
+            calculated_points = sum(float(criterion.get('points', 0)) for criterion in rubric)
+            logger.info(f"Assignment points_possible is {points_possible}, calculating from rubric: {calculated_points}")
+            points_possible = calculated_points
+        
+        logger.info(f"Successfully loaded rubric with {len(rubric)} criteria, total points: {points_possible}")
         return rubric, float(points_possible) if points_possible is not None else None
     
     logger.warning("No rubric found")
@@ -391,6 +400,28 @@ class DynamicRubricConfig:
             "openai": self.get_models_for_provider("openai"),
             "google": self.get_models_for_provider("google"),
         }
+    
+    def get_leniency_multiplier(self) -> float:
+        """
+        Get grading leniency multiplier from config.
+        Returns float between 0.5 and 2.0 (default 1.0 = no adjustment)
+        
+        Examples:
+            1.0 = no adjustment
+            1.2 = 20% boost (more lenient)
+            0.9 = 10% penalty (stricter)
+        """
+        try:
+            multiplier_str = self.get_setting('leniency_multiplier', '1.0')
+            multiplier = float(multiplier_str)
+            # Clamp between 0.5 and 2.0 for safety
+            if multiplier < 0.5 or multiplier > 2.0:
+                logger.warning(f"Leniency multiplier {multiplier} out of range [0.5, 2.0], using 1.0")
+                return 1.0
+            return multiplier
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Invalid leniency_multiplier in config: {e}, using 1.0")
+            return 1.0
 
 config = DynamicRubricConfig()
 
@@ -698,15 +729,24 @@ item_type = "Discussion" if st.session_state.is_discussion else "Assignment"
 if assignment_id and st.button(f"Load {item_type} Rubric", type="primary"):
     with st.spinner(f"Loading {item_type.lower()} rubric and course documents..."):
         try:
+            # Get leniency multiplier from config
+            leniency_multiplier = config.get_leniency_multiplier()
+            
             handler = RubricAssignmentHandler(
                 assignment_key=f"dynamic_{assignment_id}",
                 display_name=assignment_name or f"{item_type} {assignment_id}",
                 canvas_assignment_id=assignment_id,
                 course_id=selected_course_id,
                 course_documents_path=documents_path,
-                llm=llm
+                llm=llm,
+                leniency_multiplier=leniency_multiplier
             )
             st.session_state.assignment_handler = handler
+            
+            # Display leniency setting
+            if leniency_multiplier != 1.0:
+                boost_pct = (leniency_multiplier - 1.0) * 100
+                st.info(f"📊 Grading leniency: {boost_pct:+.0f}% (multiplier: {leniency_multiplier})")
 
             # Fetch rubric using the enhanced function with is_discussion flag
             rubric_items, points_possible = fetch_assignment_or_discussion_rubric(
