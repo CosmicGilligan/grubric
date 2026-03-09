@@ -50,8 +50,16 @@ class CourseDocumentProcessor:
             logger.error(f"Error loading embedding model: {e}")
     
     def get_embedding_filename(self, course_name: str) -> str:
-        """Get course-specific embedding filename"""
-        safe_course_name = course_name.replace("/", "_").replace(" ", "_")
+        """Get course-specific embedding filename based on course documents path"""
+        # Extract course identifier from the course documents path
+        # Path format: ../kb/text/USHistory or ../kb/text/WorldHistory
+        if self.course_path:
+            # Get the last directory name (e.g., "USHistory" from "../kb/text/USHistory")
+            course_dir = os.path.basename(os.path.normpath(self.course_path))
+            safe_course_name = course_dir.replace("/", "_").replace(" ", "_")
+        else:
+            # Fallback to original behavior if course_path is not set
+            safe_course_name = course_name.replace("/", "_").replace(" ", "_")
         return f'embeddings_{safe_course_name}.pkl'
     
     def clean_text(self, text: str) -> str:

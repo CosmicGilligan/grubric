@@ -90,6 +90,7 @@ def create_xlsx(csv_file, output_file=None, course_id=None, assignment_id=None,
     first_names = []
     submission_texts = []
     scores = []
+    feedbacks = []
     uploads = []
     
     skipped_inactive = 0
@@ -103,6 +104,7 @@ def create_xlsx(csv_file, output_file=None, course_id=None, assignment_id=None,
         label = row[0] if len(row) > 0 else ""           # Column 0: label
         html_text = row[1] if len(row) > 1 else ""       # Column 1: HTML content
         score = row[2] if len(row) > 2 else ""           # Column 2: score
+        feedback = row[3] if len(row) > 3 else ""       # Column 3: feedback
         
         # Get user ID from label
         uid_match = re.search(r'_(\d+)', label)
@@ -132,6 +134,7 @@ def create_xlsx(csv_file, output_file=None, course_id=None, assignment_id=None,
         first_names.append(first)
         submission_texts.append(final_text if final_text else None)
         scores.append(score)
+        feedbacks.append(feedback if feedback else None)
         uploads.append("yes")
         processed += 1
     
@@ -147,6 +150,7 @@ def create_xlsx(csv_file, output_file=None, course_id=None, assignment_id=None,
         'Student First Name': first_names,
         'Student Submission Text': submission_texts,
         'Grade': scores,
+        'Feedback': feedbacks,
         'Upload?': uploads
     })
     
@@ -161,6 +165,7 @@ def create_xlsx(csv_file, output_file=None, course_id=None, assignment_id=None,
     print(f"\n✓ Created XLSX: {output_file}")
     print(f"  Rows: {len(df)}")
     print(f"  Non-empty submission texts: {df['Student Submission Text'].notna().sum()}")
+    print(f"  Non-empty feedback: {df['Feedback'].notna().sum()}")
     
     return output_file
 

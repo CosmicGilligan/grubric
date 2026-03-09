@@ -135,12 +135,26 @@ def upload_all_from_entrylist(
         label = "<unknown>"  # ensure bound for except
         try:
             label = row[0] if len(row) > 0 else "<unknown>"
-            feedback = row[2] if len(row) > 2 else ""
             user_id = extract_user_id_from_label(label)
             if user_id is None:
                 failures.append((label, "No Canvas user_id found in label"))
                 continue
-            score, _, comment = parse_score_and_comment(feedback)
+
+            # Support both old format (row[2] = "8.5/12.0 - comment")
+            # and new format (row[2] = score, row[3] = feedback text)
+            raw = row[2] if len(row) > 2 else ""
+            if len(row) > 3 and row[3]:
+                # New format: score and feedback are separate
+                try:
+                    score = float(str(raw).strip().split("/")[0]) if raw else None
+                except (ValueError, TypeError):
+                    score = None
+                comment = str(row[3]).strip()
+                # Strip leading "score/max (breakdown) - " prefix from feedback if present
+                _, _, comment = parse_score_and_comment(comment) if comment.startswith(tuple("0123456789")) else (None, None, comment)
+            else:
+                # Old format: everything in row[2]
+                score, _, comment = parse_score_and_comment(str(raw))
             upload_grade_and_comment(api_base, token, int(course_id), int(assignment_id), user_id, score, comment)
             successes += 1
         except Exception as e:
@@ -181,9 +195,23 @@ def upload_all_from_xlsx(
                 continue
             user_id = int(uid_val)
 
-            feedback_val = row.get("Grade", "")
-            feedback = "" if pd.isna(feedback_val) else str(feedback_val)
-            score, _, comment = parse_score_and_comment(feedback)
+            grade_val = row.get("Grade", None)
+            score: Optional[float] = None
+            if grade_val is not None and not (isinstance(grade_val, float) and pd.isna(grade_val)):
+                try:
+                    score = float(str(grade_val).strip().split("/")[0])
+                except (ValueError, TypeError):
+                    score = None
+
+            # Prefer dedicated Feedback column; fall back to parsing Grade string
+            if "Feedback" in df.columns and not pd.isna(row.get("Feedback", None)):
+                raw_feedback = str(row.get("Feedback", ""))
+                # Strip leading "score/max (breakdown) - " prefix, keep just the text
+                _, _, comment = parse_score_and_comment(raw_feedback)
+            else:
+                feedback_val = row.get("Grade", "")
+                feedback = "" if pd.isna(feedback_val) else str(feedback_val)
+                _, _, comment = parse_score_and_comment(feedback)
 
             upload_grade_and_comment(api_base, token, int(course_id), int(assignment_id), user_id, score, comment)
             successes += 1

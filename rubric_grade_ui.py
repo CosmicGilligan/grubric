@@ -107,12 +107,21 @@ def upload_all_grades(
     for row in entry_list:
         try:
             label = row[0] if len(row) > 0 else ""
-            feedback = row[2] if len(row) > 2 else ""
+            score_str = row[2] if len(row) > 2 else ""
+            feedback = row[3] if len(row) > 3 else ""
             user_id = extract_user_id_from_label(label)
             if user_id is None:
                 failures.append((label, "No Canvas user_id found in label"))
                 continue
-            score, _, comment = parse_score_and_comment(feedback)
+            
+            # Convert score to float, default to None if empty/invalid
+            try:
+                score = float(score_str) if score_str and score_str.strip() else None
+            except (ValueError, TypeError):
+                score = None
+                
+            # Use feedback directly as comment (no need to parse score from it)
+            comment = feedback
             upload_grade_and_comment(api_base, token, int(course_id), int(assignment_id), user_id, score, comment)
             successes += 1
         except Exception as e:
@@ -582,10 +591,11 @@ def run_grading_process(handler, entryList, model, total_points, mode="all"):
         progress_bar.progress(1.0)
         status_text.text("Grading completed!")
 
-        # Update entryList with new feedback
+        # Update entryList with new scores and feedback
         for i, result in enumerate(results):
             if i < len(entryList):
-                entryList[i][2] = result['feedback']
+                entryList[i][2] = str(result['score'])  # Score column
+                entryList[i][3] = result['feedback']    # Feedback column
 
         # Merge with original entries if selective grading
         final_entry_list = []
@@ -616,6 +626,8 @@ def run_grading_process(handler, entryList, model, total_points, mode="all"):
 
         with open(filename, 'w+', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
+            # Write header row
+            writer.writerow(['Label', 'Submission Text', 'Score', 'Feedback'])
             writer.writerows(final_entry_list)
 
         # Get course_id and assignment_id from session state
@@ -887,7 +899,8 @@ if assignment_id and st.button("Download submissions from Canvas"):
                         feedback_entry = f"{current_grade}/{st.session_state.rubric_total_points if st.session_state.rubric else '?'}" if current_grade else ""
                 else:
                     feedback_entry = ""
-                entryList.append([label, submission_text, feedback_entry])
+                # Add score column (initially empty, will be filled during grading)
+                entryList.append([label, submission_text, "", feedback_entry])
             st.session_state.entryList = entryList
             st.session_state.student_metadata = student_metadata
             st.session_state.submissions_ready_for = (int(selected_course_id), int(assignment_id))
