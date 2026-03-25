@@ -220,11 +220,11 @@ class RubricAssignmentHandler:
         except Exception:
             document_context = "No course documents available for context."
 
-        prompt = f"""You are grading {student_name}'s assignment using a specific rubric and course materials as context.
+        prompt = f"""You are grading a student submission using a specific rubric and course materials as context.
 
     STYLE:
     - Write in a friendly, encouraging tone
-    - Address {student_name} directly using "you" and "your"
+    - Use "you" and "your" to address the student
     - Be supportive and recognize effort
     - Keep feedback brief and to the point
 
@@ -240,7 +240,7 @@ class RubricAssignmentHandler:
 
     {additional_context if additional_context else ""}
 
-    {student_name}'s SUBMISSION:
+    SUBMISSION:
     {submission_text}
 
     GRADING INSTRUCTIONS:
@@ -256,7 +256,7 @@ class RubricAssignmentHandler:
     CRITERION 2: [earned_points]/[max_points] - [brief justification]
     ...
     TOTAL SCORE: [total_earned]/{self.total_points}
-    OVERALL FEEDBACK: [brief, encouraging feedback addressing {student_name} directly]
+    OVERALL FEEDBACK: [brief, encouraging feedback]
     """
         return prompt
 
@@ -265,7 +265,7 @@ class RubricAssignmentHandler:
         """Short system directive to keep the LLM on task and format."""
         return (
             "You are a supportive, generous grader. Interpret rubrics generously and give students the benefit of the doubt. "
-            "Write in a friendly, encouraging tone addressing the student directly. "
+            "Write in a friendly, encouraging tone using 'you' and 'your' without naming the student. "
             "Keep feedback brief and focused on positives. "
             "Use the exact output format requested."
         )
