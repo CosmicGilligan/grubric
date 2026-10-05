@@ -2,3 +2,5 @@
 .vscode/
 submissions
 *.pkl
+__pycache__/
+*.pyc
