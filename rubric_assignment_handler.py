@@ -36,6 +36,7 @@ class RubricAssignmentHandler:
         llm: Optional[LLMBase] = None,
         claude_client: Optional[Any] = None,  # legacy raw Anthropic client
         leniency_multiplier: float = 1.0,  # NEW: configurable grading leniency
+        required_elements: str = "",  # NEW: per-assignment must-hit items for feedback
     ) -> None:
         """
         Initialize rubric-based assignment handler
@@ -49,6 +50,7 @@ class RubricAssignmentHandler:
             llm: Unified LLM wrapper (recommended). See llm_provider.LLMBase
             claude_client: (deprecated) Raw Anthropic client; wrapped if llm not supplied
             leniency_multiplier: Multiplier for scores (1.0=no change, 1.2=20% boost, 0.9=10% stricter)
+            required_elements: Plain-text list of the items a complete answer must include (one line per question)
         """
         self.assignment_key = assignment_key
         self.display_name = display_name
@@ -56,6 +58,7 @@ class RubricAssignmentHandler:
         self.course_id = course_id
         self.course_documents_path = course_documents_path
         self.leniency_multiplier = leniency_multiplier
+        self.required_elements = (required_elements or "").strip()
 
         # Provider-agnostic LLM setup
         if llm is not None:
@@ -220,19 +223,17 @@ class RubricAssignmentHandler:
         except Exception:
             document_context = "No course documents available for context."
 
+        required = getattr(self, "required_elements", "") or ""
+        if required:
+            required_block = f"REQUIRED ELEMENTS FOR THIS ASSIGNMENT:\n{required}"
+        else:
+            required_block = (
+                "REQUIRED ELEMENTS: none supplied. Use the rubric and the course material "
+                "above to decide what a complete answer must include, and name those items "
+                "specifically in your feedback."
+            )
+
         prompt = f"""You are grading a student submission using a specific rubric and course materials as context.
-
-    STYLE:
-    - Write in a friendly, encouraging tone
-    - Use "you" and "your" to address the student
-    - Be supportive and recognize effort
-    - Keep feedback brief and to the point
-
-    GRADING APPROACH:
-    - Be generous in your interpretation of the rubric
-    - Give credit for partial understanding and effort
-    - Focus on what the student did well
-    - When work shows understanding of concepts, award full or near-full points
 
     {self.get_rubric_prompt()}
 
@@ -240,23 +241,44 @@ class RubricAssignmentHandler:
 
     {additional_context if additional_context else ""}
 
+    {required_block}
+
     SUBMISSION:
     {submission_text}
 
-    GRADING INSTRUCTIONS:
+    SCORING:
     IMPORTANT: This assignment is worth {self.total_points} TOTAL POINTS. Calculate the total score out of {self.total_points}.
-    
-    1. Evaluate the submission generously against each rubric criterion
-    2. Award full points when work demonstrates understanding, even if not perfectly expressed
-    3. For each criterion, provide BRIEF justification (1-2 sentences max)
-    4. Keep overall feedback concise (2-3 sentences)
+    - Interpret the rubric reasonably and give credit for partial understanding.
+    - Award full points only when the work actually demonstrates the understanding the criterion asks for.
+    - Do not award points for naming a topic without explaining it.
 
-    Format your response as:
-    CRITERION 1: [earned_points]/[max_points] - [brief justification]
-    CRITERION 2: [earned_points]/[max_points] - [brief justification]
+    FEEDBACK RULES:
+    Tone must match the work. Encouragement has to be earned by specific evidence.
+    - Strong or adequate work: warm and brief. Name what worked, then give one refinement.
+    - Weak or off-target work: kind but direct. Do not say the student "shows understanding" or "has the key ideas" unless you can point to the exact words that demonstrate it. If answers name topics without explaining them, say so plainly.
+    - Never use praise that could apply to any submission ("good start," "you've identified the key topics") without saying what, specifically, was identified.
+
+    Each criterion comment follows this order:
+    1. What is there: one specific observation that quotes or points to the student's actual words. If nothing meets the criterion, say so.
+    2. What is missing or wrong: name the specific missing items from the REQUIRED ELEMENTS. If the student made a factual error or misread the material, state it and correct it in one sentence.
+    3. How to fix it: one concrete move the student can do next time. Describe the move (for example, "after saying deflation hurt farmers, explain the chain that links the money supply to debt"); do not write the answer for them.
+
+    Diagnose the pattern. If the same weakness recurs across answers (labels without explanation, no evidence from the lesson, stopping before the "so what"), name it once in the overall feedback as the main thing to fix.
+
+    Be consistent. Feedback must explain the score: if points were lost, say why in terms of the rubric. Never pair a low score with a positive-sounding comment.
+
+    Do not write model answers, supply the full correct explanation, or restate the lecture.
+
+    Length: 2-3 sentences per criterion, 4-6 sentences for the overall feedback. Specific beats long.
+    Write ratios as 16:1, never with a slash between numbers.
+
+    OUTPUT FORMAT (use exactly this):
+    ANALYSIS: [Internal notes, 80 words max: which required elements appear, which are missing, any factual errors, and whether the work is strong, adequate, weak, or off-target. Do not use the words CRITERION or TOTAL SCORE here.]
+    CRITERION 1: [earned_points]/[max_points] - [comment following the three-part order above]
+    CRITERION 2: [earned_points]/[max_points] - [comment]
     ...
     TOTAL SCORE: [total_earned]/{self.total_points}
-    OVERALL FEEDBACK: [brief, encouraging feedback]
+    OVERALL FEEDBACK: [4-6 sentences: the main pattern, the most important missing items, any factual corrections, and one clear next step]
     """
         return prompt
 
@@ -264,9 +286,11 @@ class RubricAssignmentHandler:
     def build_system_prompt(self) -> str:
         """Short system directive to keep the LLM on task and format."""
         return (
-            "You are a supportive, generous grader. Interpret rubrics generously and give students the benefit of the doubt. "
-            "Write in a friendly, encouraging tone using 'you' and 'your' without naming the student. "
-            "Keep feedback brief and focused on positives. "
+            "You are a fair, honest grader who gives specific, actionable feedback. "
+            "Address the student as 'you' and 'your' without naming them. "
+            "Keep a warm, respectful tone, but praise only what the student actually did, "
+            "and always say plainly what is missing and how to fix it. "
+            "Interpret the rubric reasonably and give credit for partial understanding. "
             "Use the exact output format requested."
         )
 

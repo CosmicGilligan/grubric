@@ -21,7 +21,6 @@ from pathlib import Path
 from canvas_rubric_api import CanvasRubricAPI
 from course_document_processor import CourseDocumentProcessor
 from rubric_assignment_handler import RubricAssignmentHandler
-import grade_all
 from create_xlsx import create_xlsx
 from canvas_submissions import download_submissions_flat
 
@@ -539,6 +538,11 @@ def run_grading_process(handler, entryList, model, total_points, mode="all"):
         total_points: Total points for the assignment
         mode: "all" or "selective"
     """
+    # Pick up the latest required-elements text, so edits made after loading the rubric still apply
+    handler.required_elements = (
+        st.session_state.get(f"required_elements_{handler.canvas_assignment_id}") or ""
+    ).strip()
+
     progress_bar = st.progress(0)
     status_text = st.empty()
     current_student = st.empty()
@@ -747,12 +751,30 @@ st.subheader("Step 3: Load Rubric")
 
 item_type = "Discussion" if st.session_state.is_discussion else "Assignment"
 
+# Optional: the must-hit items for this assignment. Each Canvas ID gets its own box, so text
+# typed for one assignment never leaks into another. Used to make feedback specific.
+required_elements_text = st.text_area(
+    "Required elements (optional): what a complete answer must include",
+    key=f"required_elements_{assignment_id or 'none'}",
+    height=170,
+    placeholder=(
+        "One line per question, for example:\n"
+        "Q1: machine bosses; immigrant hiring; jobs-for-votes exchange; election-day loyalty\n"
+        "Q2: tariff; gold standard vs. greenbacks; deflation; debt spiral; free silver 16:1"
+    ),
+    help=(
+        "Names, terms, and ideas from the lesson that a complete answer should hit. "
+        "When filled in, feedback names what is missing instead of giving generic advice. "
+        "Leave blank to let the model work it out from the rubric and course documents."
+    ),
+)
+
 if assignment_id and st.button(f"Load {item_type} Rubric", type="primary"):
     with st.spinner(f"Loading {item_type.lower()} rubric and course documents..."):
         try:
             # Get leniency multiplier from config
             leniency_multiplier = config.get_leniency_multiplier()
-            
+
             handler = RubricAssignmentHandler(
                 assignment_key=f"dynamic_{assignment_id}",
                 display_name=assignment_name or f"{item_type} {assignment_id}",
@@ -760,7 +782,8 @@ if assignment_id and st.button(f"Load {item_type} Rubric", type="primary"):
                 course_id=selected_course_id,
                 course_documents_path=documents_path,
                 llm=llm,
-                leniency_multiplier=leniency_multiplier
+                leniency_multiplier=leniency_multiplier,
+                required_elements=required_elements_text,
             )
             st.session_state.assignment_handler = handler
             
