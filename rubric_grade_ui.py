@@ -543,6 +543,11 @@ def run_grading_process(handler, entryList, model, total_points, mode="all"):
         st.session_state.get(f"required_elements_{handler.canvas_assignment_id}") or ""
     ).strip()
 
+    # Same for leniency: use whatever is in the box now, even if it changed after loading
+    _len_val = st.session_state.get(f"leniency_{handler.canvas_assignment_id}")
+    if _len_val is not None:
+        handler.leniency_multiplier = max(0.5, min(2.0, float(_len_val)))
+
     progress_bar = st.progress(0)
     status_text = st.empty()
     current_student = st.empty()
@@ -769,11 +774,29 @@ required_elements_text = st.text_area(
     ),
 )
 
+# Per-assignment leniency. Starts at the default from config_rubric.ini; changing it here
+# affects only this run and never writes back to the config file.
+config_leniency = config.get_leniency_multiplier()
+leniency_input = st.number_input(
+    f"Leniency multiplier (config default: {config_leniency:.2f})",
+    min_value=0.5,
+    max_value=2.0,
+    value=float(config_leniency),
+    step=0.05,
+    format="%.2f",
+    key=f"leniency_{assignment_id or 'none'}",
+    help=(
+        "1.00 = no adjustment, 1.20 = 20% boost, 0.90 = 10% stricter. Scores are multiplied by "
+        "this value and capped at the maximum. Changing it here applies to this assignment only "
+        "and does not change config_rubric.ini."
+    ),
+)
+
 if assignment_id and st.button(f"Load {item_type} Rubric", type="primary"):
     with st.spinner(f"Loading {item_type.lower()} rubric and course documents..."):
         try:
-            # Get leniency multiplier from config
-            leniency_multiplier = config.get_leniency_multiplier()
+            # Use the value from the box above (which started at the config default)
+            leniency_multiplier = float(leniency_input)
 
             handler = RubricAssignmentHandler(
                 assignment_key=f"dynamic_{assignment_id}",
