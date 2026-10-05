@@ -267,6 +267,8 @@ class RubricAssignmentHandler:
 
     Be consistent. Feedback must explain the score: if points were lost, say why in terms of the rubric. Never pair a low score with a positive-sounding comment.
 
+    Voice: speak directly to the student in every comment, including the overall feedback. Use "you" and "your" for the student's work and choices. Never write "the student," "this student," or "they/their/them" about the student. ("They" is fine only for historical people or groups.)
+
     Do not write model answers, supply the full correct explanation, or restate the lecture.
 
     Length: 2-3 sentences per criterion, 4-6 sentences for the overall feedback. Specific beats long.
@@ -312,18 +314,28 @@ class RubricAssignmentHandler:
                 {"role": "user",   "content": user_prompt},
             ]
 
-            reply_text = self.llm.generate(
-                model=model,
-                messages=messages,
-                temperature=0.2,
-                max_tokens=2048,
-            )
+            # Up to 2 attempts: the longer feedback format can be cut off or come back
+            # malformed, which used to produce a score with "No detailed feedback provided".
+            reply_text = ""
+            for attempt in (1, 2):
+                reply_text = self.llm.generate(
+                    model=model,
+                    messages=messages,
+                    temperature=0.2,
+                    max_tokens=4096,
+                )
 
-            # DEBUG: Print raw response
-            logger.info(f"RAW AI RESPONSE for {student_name}:")
-            logger.info(reply_text)
-            logger.info("=" * 80)
+                # DEBUG: Print raw response
+                logger.info(f"RAW AI RESPONSE for {student_name} (attempt {attempt}):")
+                logger.info(reply_text)
+                logger.info("=" * 80)
 
+                if self._response_is_complete(reply_text):
+                    break
+                logger.warning(
+                    f"Incomplete grading response for {student_name} on attempt {attempt} "
+                    f"(missing TOTAL SCORE or OVERALL FEEDBACK text)."
+                )
 
             return self._parse_grading_response(reply_text, student_name)
 
@@ -343,8 +355,27 @@ class RubricAssignmentHandler:
     def parse_model_reply(self, reply_text: str, student_name: str) -> Dict[str, Any]:
         return self._parse_grading_response(reply_text, student_name)
 
+    @staticmethod
+    def _clean_markdown(text: str) -> str:
+        """Strip markdown emphasis/headers so labels like **OVERALL FEEDBACK:** still parse."""
+        if not isinstance(text, str):
+            return ""
+        text = re.sub(r"\*{1,3}|_{2,}", "", text)          # **bold**, *italic*, __bold__
+        text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)   # leading markdown headers
+        return text
+
+    def _response_is_complete(self, response_text: str) -> bool:
+        """True if the reply has criterion lines, a total, and non-empty overall feedback."""
+        text = self._clean_markdown(response_text)
+        has_criteria = re.search(r"CRITERION\s+\d+\s*:", text, re.IGNORECASE) is not None
+        has_total = re.search(r"TOTAL SCORE\s*:", text, re.IGNORECASE) is not None
+        overall = re.search(r"OVERALL\s+FEEDBACK\s*:\s*(\S.{20,})", text, re.IGNORECASE | re.DOTALL)
+        return bool(has_criteria and has_total and overall)
+
     def _parse_grading_response(self, response_text: str, student_name: str) -> Dict[str, Any]:
         """Parse model grading response into structured data"""
+        raw_response_text = response_text
+        response_text = self._clean_markdown(response_text)
         try:
             # Initialize result WITHOUT letter_grade
             result: Dict[str, Any] = {
@@ -353,7 +384,7 @@ class RubricAssignmentHandler:
                 "max_score": float(self.total_points),
                 "feedback": response_text,
                 "criterion_scores": [],
-                "raw_response": response_text,
+                "raw_response": raw_response_text,
             }
 
             # Extract total score
@@ -381,7 +412,7 @@ class RubricAssignmentHandler:
                     result["max_score"] = float(self.total_points)
 
             # Extract individual criterion scores and justifications
-            criterion_pattern = r"CRITERION (\d+):\s*(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)\s*-\s*(.+?)(?=(?:CRITERION \d+:|TOTAL SCORE:|OVERALL FEEDBACK:|$))"
+            criterion_pattern = r"CRITERION (\d+):\s*(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)\s*[-–—:]\s*(.+?)(?=(?:CRITERION \d+:|TOTAL SCORE:|OVERALL\s+FEEDBACK\s*:|$))"
             criterion_matches = re.findall(
                 criterion_pattern, response_text, re.IGNORECASE | re.DOTALL
             )
@@ -418,7 +449,7 @@ class RubricAssignmentHandler:
 
             # Extract overall feedback
             overall_feedback_match = re.search(
-                r"OVERALL FEEDBACK:\s*(.+)$", response_text, re.IGNORECASE | re.DOTALL
+                r"OVERALL\s+FEEDBACK\s*:\s*(.+)$", response_text, re.IGNORECASE | re.DOTALL
             )
             
             # Check if we successfully extracted a score
@@ -444,12 +475,21 @@ class RubricAssignmentHandler:
                     # Already formatted, just use cleaned version
                     result["feedback"] = cleaned_feedback
             else:
-                # No overall feedback found, just use score and breakdown
+                # No overall feedback found: fall back to the per-criterion comments so the
+                # student still gets written feedback instead of "No detailed feedback provided".
                 breakdown_str = ", ".join([f"{cs['earned']:.1f}" for cs in result["criterion_scores"]])
+                fallback_text = " ".join(
+                    re.sub(r"\b\d+(?:\.\d+)?/\d+(?:\.\d+)?\b\s*-?\s*", "", cs["justification"]).strip()
+                    for cs in result["criterion_scores"]
+                    if cs["justification"]
+                ).strip()
+                if not fallback_text:
+                    fallback_text = "No detailed feedback provided"
+                    logger.warning(f"No feedback text could be recovered for {student_name}.")
                 if breakdown_str:
-                    result["feedback"] = f"{result['score']:.1f}/{result['max_score']} ({breakdown_str}) - No detailed feedback provided"
+                    result["feedback"] = f"{result['score']:.1f}/{result['max_score']} ({breakdown_str}) - {fallback_text}"
                 else:
-                    result["feedback"] = f"{result['score']:.1f}/{result['max_score']} - No detailed feedback provided"
+                    result["feedback"] = f"{result['score']:.1f}/{result['max_score']} - {fallback_text}"
 
             # Keep personalized language in criterion justifications - don't normalize
 
