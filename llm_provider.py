@@ -1,6 +1,9 @@
 # llm_provider.py
 from __future__ import annotations
 from typing import List, Dict, Any
+import logging
+
+logger = logging.getLogger(__name__)
 
 # We accept OpenAI-style messages:
 # [{"role": "system"|"user"|"assistant", "content": "..."}, ...]
@@ -30,13 +33,24 @@ class AnthropicLLM(LLMBase):
             elif role in ("user", "assistant"):
                 converted.append({"role": role, "content": m.get("content", "")})
 
-        resp = self.client.messages.create(
+        base_kwargs = dict(
             model=model,
             system=system or None,
             max_tokens=max_tokens,
-            temperature=temperature,
             messages=converted,
         )
+
+        try:
+            # Default: don't send temperature at all. Newer Claude models
+            # (Sonnet 5, Opus 4.7+) reject it outright with a 400, and
+            # omitting it is valid for every model (falls back to Anthropic's
+            # own default), so this is the common, single-request path.
+            resp = self.client.messages.create(**base_kwargs)
+        except Exception as e:
+            # Fallback only, in case some call site/model genuinely needs an
+            # explicit temperature. Retries once with it included.
+            logger.info(f"Model {model} failed without `temperature`; retrying with it. Error: {e}")
+            resp = self.client.messages.create(temperature=temperature, **base_kwargs)
         # Anthropic returns a list of content blocks; take the first text block
         for block in getattr(resp, "content", []) or []:
             if getattr(block, "type", None) == "text":

@@ -29,6 +29,9 @@ from canvas_submissions import download_submissions_flat
 from client import get_client
 from llm_provider import make_llm
 
+# NEW: live model catalog fetcher (replaces stale config-file model lists)
+from model_catalog import fetch_anthropic_models, fetch_openai_models, fetch_google_models
+
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -292,6 +295,8 @@ def _init_state():
     st.session_state.setdefault("stop_processing", False)
     st.session_state.setdefault("grading_mode", "all")
     st.session_state.setdefault("selected_students", set())
+    st.session_state.setdefault("session_graded_ids", set())  # tracks user IDs graded THIS session
+    st.session_state.setdefault("keep_highest_score", False)
 
 def _recompute_ready_flag():
     st.session_state.ready_to_grade = (
@@ -348,6 +353,13 @@ class DynamicRubricConfig:
             return self.config['PATHS'][path_name]
         return default
     
+    def get_key_file(self, provider: str) -> str:
+        """Get the API key file path for a provider from [API_SETTINGS].
+        Looks for '<provider>_key_file' (e.g. anthropic_key_file)."""
+        if 'API_SETTINGS' in self.config:
+            return self.config['API_SETTINGS'].get(f"{provider}_key_file", "")
+        return ""
+    
     def save_assignment_to_history(self, assignment_name: str, assignment_id: str, course_id: str):
         """Save assignment to history for quick access"""
         if 'ASSIGNMENT_HISTORY' not in self.config:
@@ -376,7 +388,9 @@ class DynamicRubricConfig:
     
     def get_models_for_provider(self, provider: str) -> Dict[str, str]:
         """
-        Get models for a specific provider from config.
+        Get models for a specific provider from config (OFFLINE FALLBACK ONLY —
+        the sidebar prefers live results from the provider's API; this is only
+        used if that fetch fails or no key file is configured).
         Returns dict of {display_name: model_id}
         
         Args:
@@ -398,17 +412,6 @@ class DynamicRubricConfig:
                     logger.warning(f"Invalid model config for {provider}.{key}: {value}")
         
         return models
-    
-    def get_all_models(self) -> Dict[str, Dict[str, str]]:
-        """
-        Get all configured models for all providers.
-        Returns nested dict: {provider: {display_name: model_id}}
-        """
-        return {
-            "anthropic": self.get_models_for_provider("anthropic"),
-            "openai": self.get_models_for_provider("openai"),
-            "google": self.get_models_for_provider("google"),
-        }
     
     def get_leniency_multiplier(self) -> float:
         """
@@ -434,43 +437,45 @@ class DynamicRubricConfig:
 
 config = DynamicRubricConfig()
 
-# Model validation at startup
-def validate_models_at_startup():
-    """
-    Validate that configured models are accessible.
-    Logs warnings for any issues but doesn't prevent startup.
-    """
-    all_models = config.get_all_models()
-    
-    # Known valid model patterns (as of Nov 2025)
-    valid_patterns = {
-        "anthropic": ["claude-sonnet-4", "claude-3-5-sonnet", "claude-3-opus", "claude-3-haiku"],
-        "openai": ["gpt-4o", "gpt-4-turbo", "gpt-4"],
-        "google": ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-"],
-    }
-    
-    warnings = []
-    
-    for provider, models in all_models.items():
-        if not models:
-            warnings.append(f"⚠️ No {provider.title()} models configured - using defaults")
-            continue
-            
-        patterns = valid_patterns.get(provider, [])
-        for display_name, model_id in models.items():
-            # Check if model ID matches any known pattern
-            if not any(pattern in model_id for pattern in patterns):
-                warnings.append(f"⚠️ {provider.title()}: '{model_id}' may be invalid (from '{display_name}')")
-    
-    if warnings:
-        logger.warning("\n".join(["Model validation warnings:"] + warnings))
-    else:
-        logger.info("✓ All configured models appear valid")
-    
-    return warnings
+# ═══════════════════════════════════════════════════════════════════════════
+# Live model catalog (replaces the old hardcoded validate_models_at_startup)
+# ═══════════════════════════════════════════════════════════════════════════
+_PROVIDER_FETCHERS = {
+    "anthropic": fetch_anthropic_models,
+    "openai": fetch_openai_models,
+    "google": fetch_google_models,
+}
 
-# Run validation at startup (only log, don't block)
-model_warnings = validate_models_at_startup()
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_models_cached(provider: str, key_file: str) -> Tuple[List[Tuple[str, str]], Optional[str]]:
+    """
+    Live-fetches models for `provider` and returns
+    ([(display_name, model_id), ...], error_message_or_None).
+    Cached for an hour per (provider, key_file) so a Streamlit rerun doesn't
+    hit the provider's API every time a widget changes.
+    """
+    try:
+        models = _PROVIDER_FETCHERS[provider](key_file)
+        return [(m.display_name, m.id) for m in models], None
+    except Exception as e:
+        return [], str(e)
+
+def get_model_choices(provider: str) -> Dict[str, str]:
+    """
+    Live model list for `provider`, falling back to the static
+    [*_MODELS] section in config_rubric.ini if the key file is missing
+    or the API call fails (e.g. no network).
+    """
+    key_file = config.get_key_file(provider)
+    if key_file and os.path.exists(key_file):
+        pairs, error = fetch_models_cached(provider, key_file)
+        if pairs:
+            return dict(pairs)
+        if error:
+            st.sidebar.warning(f"Couldn't fetch live {provider} models ({error}) — using config file list.")
+    else:
+        st.sidebar.info(f"No {provider}_key_file configured — using config file list for {provider}.")
+    return config.get_models_for_provider(provider)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Provider & Model selection
@@ -487,42 +492,20 @@ st.markdown("*Enter Canvas assignment ID to automatically load rubric and grade 
 with st.sidebar:
     st.header("Model Settings")
     provider = st.selectbox("AI Provider", ["anthropic", "openai", "google"], index=0)
-    
-    # Load models from config file with fallback to defaults
-    config_models = config.get_all_models()
-    
-    # Fallback defaults if config is missing or empty
-    default_models = {
-        "anthropic": {
-            "Claude Sonnet 4.5 (latest)": "claude-sonnet-4-5-20250929",
-            "Claude Sonnet 4": "claude-sonnet-4-20250514",
-            "Claude 3.5 Sonnet": "claude-3-5-sonnet-20241022",
-            "Claude 3 Opus": "claude-3-opus-20240229",
-            "Claude 3 Haiku": "claude-3-haiku-20240307",
-        },
-        "openai": {
-            "GPT-4o": "gpt-4o",
-            "GPT-4o mini": "gpt-4o-mini",
-            "GPT-4 Turbo": "gpt-4-turbo",
-        },
-        "google": {
-            "Gemini 1.5 Pro": "gemini-1.5-pro",
-            "Gemini 1.5 Flash": "gemini-1.5-flash",
-        },
-    }
-    
-    # Use config models if available, otherwise use defaults
-    model_choices = {}
-    for prov in ["anthropic", "openai", "google"]:
-        if config_models.get(prov):
-            model_choices[prov] = config_models[prov]
-            logger.info(f"Loaded {len(config_models[prov])} {prov} models from config")
-        else:
-            model_choices[prov] = default_models[prov]
-            logger.warning(f"Using default models for {prov} (not found in config)")
-    
-    model_name = st.selectbox("Model", list(model_choices[provider].keys()))
-    selected_model = model_choices[provider][model_name]
+
+    col_refresh, _ = st.columns([1, 3])
+    with col_refresh:
+        if st.button("🔄 Refresh models"):
+            fetch_models_cached.clear()
+            st.rerun()
+
+    model_choices = get_model_choices(provider)
+    if not model_choices:
+        st.error(f"No {provider} models available (live fetch failed and no fallback configured).")
+        st.stop()
+
+    model_name = st.selectbox("Model", list(model_choices.keys()))
+    selected_model = model_choices[model_name]
     
     # Display model info
     st.caption(f"Model ID: `{selected_model}`")
@@ -597,6 +580,24 @@ def run_grading_process(handler, entryList, model, total_points, mode="all"):
                 entryList[i][2] = str(result['score'])  # Score column
                 entryList[i][3] = result['feedback']    # Feedback column
 
+        # Keep highest score if toggle is on (selective mode only)
+        if mode == "selective" and st.session_state.get("keep_highest_score", False):
+            metadata = st.session_state.get("student_metadata", {})
+            retained_count = 0
+            for entry in entryList:
+                user_id = str(extract_user_id_from_label(entry[0]))
+                old_score = (metadata.get(user_id) or {}).get("current_score")
+                try:
+                    new_score = float(entry[2]) if entry[2] else None
+                except (ValueError, TypeError):
+                    new_score = None
+                if old_score is not None and new_score is not None and new_score < old_score:
+                    entry[2] = str(old_score)
+                    entry[3] = f"Highest score retained. {entry[3]}"
+                    retained_count += 1
+            if retained_count:
+                st.info(f"↑ Highest score retained for {retained_count} student(s) whose resubmission scored lower")
+
         # Merge with original entries if selective grading
         final_entry_list = []
         if mode == "selective":
@@ -607,6 +608,9 @@ def run_grading_process(handler, entryList, model, total_points, mode="all"):
                 if user_id:
                     graded_map[str(user_id)] = entry
             
+            # Track which IDs were graded this session (used to restrict upload)
+            st.session_state.session_graded_ids = set(graded_map.keys())
+
             # Build final list: use graded version if available, otherwise original
             for user_id, original_entry in st.session_state.original_entries.items():
                 if user_id in graded_map:
@@ -617,6 +621,11 @@ def run_grading_process(handler, entryList, model, total_points, mode="all"):
             preserved_count = len(final_entry_list) - len(graded_map)
             st.info(f"✓ Merged results: {len(graded_map)} newly graded + {preserved_count} preserved with original grades/feedback")
         else:
+            # All-students mode: every entry is fresh, upload all
+            st.session_state.session_graded_ids = {
+                str(extract_user_id_from_label(e[0])) for e in entryList
+                if extract_user_id_from_label(e[0])
+            }
             final_entry_list = entryList
 
         # Write to CSV
@@ -1080,6 +1089,12 @@ if st.session_state.ready_to_grade:
                 str(extract_user_id_from_label(entry[0])) in st.session_state.selected_students
             ]
             st.info(f"Ready to grade {len(entries_to_grade)} selected submissions (out of {len(entryList)} total) using **{provider} → {selected_model}**")
+
+            st.session_state.keep_highest_score = st.toggle(
+                "Keep Highest Score?",
+                value=st.session_state.keep_highest_score,
+                help="If a resubmission scores lower than the student's current grade, the original score is retained and a note added to the feedback."
+            )
             
             if st.button("Start Grading Selected", type="primary"):
                 run_grading_process(handler, entries_to_grade, selected_model, total_points, mode="selective")
@@ -1135,14 +1150,23 @@ if source == "Current session (graded list)":
                     st.stop()
         
         with st.spinner("Uploading grades..."):
+            # Only upload students graded in THIS session — never re-post old comments
+            session_ids = st.session_state.get("session_graded_ids", set())
+            if session_ids:
+                upload_list = [
+                    e for e in st.session_state.entryList
+                    if str(extract_user_id_from_label(e[0])) in session_ids
+                ]
+            else:
+                upload_list = st.session_state.entryList
             ok, fail, failures = upload_all_from_entrylist(
                 api_base=canvas_url,
                 token=token,
                 course_id=int(selected_course_id),
                 assignment_id=int(upload_assignment_id),
-                entry_list=st.session_state.entryList,
+                entry_list=upload_list,
             )
-        st.success(f"Uploaded {ok} grades")
+        st.success(f"Uploaded {ok} grades ({len(upload_list)} students graded this session)")
         if fail:
             st.warning(f"{fail} failed")
             with st.expander("View failures"):
@@ -1244,11 +1268,3 @@ with st.sidebar:
     st.header("System Status")
     st.success("Canvas API: Connected")
     st.success(f"LLM: {provider.title()} ready")
-    
-    # Show model validation warnings if any
-    if model_warnings:
-        with st.expander(f"⚠️ {len(model_warnings)} Model Warning(s)", expanded=False):
-            for warning in model_warnings:
-                st.warning(warning)
-    else:
-        st.success("✓ All models validated")
